@@ -1,0 +1,20 @@
+# Local configuration contains credentials and must never be committed.
+MediaStack-Control-Gateway.config.psd1
+
+# Managed runtime files, in case InstallRoot is pointed inside the repository.
+media_stack_gateway.py
+run-tunnel.ps1
+watch-tunnel.ps1
+profiles/
+logs/
+reporting-exports/
+bin/
+downloads/
+Python312-NuGet/
+
+# Common local/editor artifacts
+*.log
+*.tmp
+*.bak
+.vscode/
+.idea/
