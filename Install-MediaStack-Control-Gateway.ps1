@@ -1,7 +1,7 @@
 #requires -RunAsAdministrator
 <#
 MediaStack Control Gateway Installer for Windows Server
-v3.4.1 - ARR MANAGEMENT / TAUTULLI REPORTING / COLLECTION METADATA / SELF-HEALING TUNNEL / IDEMPOTENT
+v3.4.2 - ITEM SUMMARY METADATA / ARR MANAGEMENT / TAUTULLI REPORTING / COLLECTION METADATA / SELF-HEALING TUNNEL / IDEMPOTENT
 
 Safe to run repeatedly.
 
@@ -20,6 +20,7 @@ Behavior:
   * Adds Tautulli export tools so full CSV/JSON inventory exports can be generated locally and transferred in chunks only when requested.
   * Adds Sonarr, Radarr, and Lidarr reporting, item management, bulk quality/monitor/search workflows, and local inventory exports.
   * v3.4.1 fixes lightweight Arr connectivity status and owner-scoped file enumeration/storage reporting for current Arr APIs.
+  * v3.4.2 adds read/write tools for individual movie/show Summary fields while preserving all other item metadata.
   * Arr deletions require a short-lived prepared confirmation token before the destructive call can execute.
   * New Radarr/Sonarr/Lidarr requests require an explicit root folder/profile instead of guessing storage paths.
 
@@ -430,7 +431,7 @@ function Test-TunnelClient {
     }
 }
 
-Write-Host "MediaStack Control Gateway installer for Windows Server - v3.4.1 ARR MANAGEMENT / TAUTULLI REPORTING / COLLECTION METADATA / SELF-HEALING TUNNEL / IDEMPOTENT" -ForegroundColor Green
+Write-Host "MediaStack Control Gateway installer for Windows Server - v3.4.2 ITEM SUMMARY METADATA / ARR MANAGEMENT / TAUTULLI REPORTING / COLLECTION METADATA / SELF-HEALING TUNNEL / IDEMPOTENT" -ForegroundColor Green
 Write-Host "Safe to run repeatedly. Existing working components are skipped." -ForegroundColor Green
 Write-Host "HARD NONINTERACTIVE MODE: all PowerShell confirmation prompts are suppressed." -ForegroundColor Green
 Write-Host "Working root: $Root" -ForegroundColor Green
@@ -825,7 +826,7 @@ mcp = MCPServer(
     "MediaStack Control Gateway",
     instructions=(
         "Tools for visibility across all Plex libraries and collections, regular collection "
-        "management, collection metadata management, smart collection filter management, narrowly "
+        "management, collection metadata management, individual movie/show summary metadata management, smart collection filter management, narrowly "
         "scoped TV episode playlist creation, Tautulli-backed reporting, and Sonarr/Radarr/Lidarr management. "
         "Use plex_reporting_* for Plex analytics and arr_*/sonarr_*/radarr_*/lidarr_* for Arr reporting and management. "
         "Large datasets should be processed locally and summarized before crossing the tunnel. Resolve exact items with read tools "
@@ -1479,6 +1480,101 @@ def plex_update_collection_metadata(
         "changed": bool(changes),
         "changed_fields": changes,
         "metadata": _collection_metadata(collection, section, include_visibility=True),
+    }
+
+
+@mcp.tool(
+    description=(
+        "Read the current Summary field for one exact Plex movie or TV show by rating key. "
+        "Returns only compact identity/summary metadata and makes no changes."
+    ),
+    annotations=ToolAnnotations(read_only_hint=True, idempotent_hint=True),
+)
+def plex_get_item_summary(
+    library_name: str,
+    rating_key: str,
+) -> dict:
+    server = _plex()
+    section = _exact_section(server, library_name)
+    items = _load_rating_key_items(server, section, [rating_key])
+    item = items[0]
+    item.reload()
+
+    item_type = getattr(item, "TYPE", None) or item.__class__.__name__.lower()
+    if item_type not in {"movie", "show"}:
+        raise ValueError("plex_get_item_summary currently supports movie and show items only.")
+
+    summary = getattr(item, "summary", None) or ""
+    locked = None
+    try:
+        for field in getattr(item, "fields", []) or []:
+            if getattr(field, "name", None) == "summary":
+                locked = bool(getattr(field, "locked", False))
+                break
+    except Exception:
+        locked = None
+
+    return {
+        "library": section.title,
+        "type": item_type,
+        "title": getattr(item, "title", None),
+        "year": getattr(item, "year", None),
+        "rating_key": str(getattr(item, "ratingKey", "")) or None,
+        "summary": summary,
+        "summary_missing": not bool(summary.strip()),
+        "summary_locked": locked,
+    }
+
+
+@mcp.tool(
+    description=(
+        "Replace the Summary field for one exact Plex movie or TV show by rating key. "
+        "Only Summary is changed; title, artwork, collections, labels, ratings, files, and all other metadata are preserved. "
+        "The edited Summary is locked so future metadata refreshes do not overwrite the manual value."
+    ),
+    annotations=ToolAnnotations(read_only_hint=False, destructive_hint=False, idempotent_hint=True),
+)
+def plex_update_item_summary(
+    library_name: str,
+    rating_key: str,
+    summary: str,
+) -> dict:
+    server = _plex()
+    section = _exact_section(server, library_name)
+    items = _load_rating_key_items(server, section, [rating_key])
+    item = items[0]
+    item.reload()
+
+    item_type = getattr(item, "TYPE", None) or item.__class__.__name__.lower()
+    if item_type not in {"movie", "show"}:
+        raise ValueError("plex_update_item_summary currently supports movie and show items only.")
+
+    desired = str(summary)
+    current = getattr(item, "summary", None) or ""
+    if current == desired:
+        return {
+            "changed": False,
+            "library": section.title,
+            "type": item_type,
+            "title": getattr(item, "title", None),
+            "year": getattr(item, "year", None),
+            "rating_key": str(getattr(item, "ratingKey", "")) or None,
+            "summary": current,
+        }
+
+    item.batchEdits()
+    item.editSummary(desired, locked=True)
+    item.saveEdits()
+    item.reload()
+
+    return {
+        "changed": True,
+        "library": section.title,
+        "type": item_type,
+        "title": getattr(item, "title", None),
+        "year": getattr(item, "year", None),
+        "rating_key": str(getattr(item, "ratingKey", "")) or None,
+        "summary": getattr(item, "summary", None) or "",
     }
 
 
@@ -2348,7 +2444,7 @@ def _tautulli_endpoint(cmd: str, params: Optional[dict] = None) -> str:
 
 def _tautulli_api(cmd: str, params: Optional[dict] = None, timeout: int = 60):
     url = _tautulli_endpoint(cmd, params)
-    request = Request(url, headers={"User-Agent": "MediaStack-Control-Gateway/3.4"})
+    request = Request(url, headers={"User-Agent": "MediaStack-Control-Gateway/3.4.2"})
     try:
         with urlopen(request, timeout=timeout) as response:
             raw = response.read()
@@ -2962,7 +3058,7 @@ def plex_reporting_export_status(library_name: str, export_id: int) -> dict:
 def _download_export_to_local_cache(export_id: int) -> dict:
     export_id = int(export_id)
     url = _tautulli_endpoint("download_export", {"export_id": export_id})
-    request = Request(url, headers={"User-Agent": "MediaStack-Control-Gateway/3.4"})
+    request = Request(url, headers={"User-Agent": "MediaStack-Control-Gateway/3.4.2"})
     try:
         with urlopen(request, timeout=300) as response:
             raw = response.read()
@@ -3217,7 +3313,7 @@ def _arr_api(
     headers = {
         "X-Api-Key": cfg["api_key"],
         "Accept": "application/json",
-        "User-Agent": "MediaStack-Control-Gateway-Arr/3.4.1",
+        "User-Agent": "MediaStack-Control-Gateway-Arr/3.4.2",
     }
     if body is not None:
         data = json.dumps(body).encode("utf-8")
@@ -4937,6 +5033,7 @@ Write-Host "This installer is now safe to run again." -ForegroundColor Green
 Write-Host "Working stages will report SKIP; only missing/broken stages will be repaired." -ForegroundColor Green
 Write-Host "SELF-HEALING ENABLED: tunnel-client restarts automatically after exit, and a watchdog checks /readyz every minute." -ForegroundColor Green
 Write-Host "COLLECTION METADATA ENABLED: read/update summaries, sort/display settings, labels, visibility, posters, and background art." -ForegroundColor Green
+Write-Host "ITEM SUMMARY METADATA ENABLED: read/update movie and TV show summaries by exact Plex rating key; edits are locked and preserve all other metadata." -ForegroundColor Green
 Write-Host "TAUTULLI REPORTING ENABLED: cached library counts, logical storage, media breakdowns, history/top stats, and local CSV/JSON exports." -ForegroundColor Green
 Write-Host "REPORTING DESIGN: normal questions return compact aggregates; full inventory data crosses the tunnel only when an export is explicitly requested." -ForegroundColor Green
 Write-Host "ARR MANAGEMENT ENABLED: Sonarr/Radarr/Lidarr reporting, adds/edits, explicit-path requests, bulk monitor/profile/search workflows, and inventory exports." -ForegroundColor Green

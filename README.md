@@ -36,6 +36,7 @@ The gateway provides tools to:
 * Add, remove, or replace collection members.
 * Create and modify smart collections and their filters.
 * Read and update collection summaries, labels, visibility, sort/display settings, posters, and background art.
+* Read and update individual movie and TV show summaries by exact Plex rating key while preserving other item metadata.
 * Search TV shows and episodes.
 * Create narrowly scoped TV playlists.
 
