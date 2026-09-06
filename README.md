@@ -37,8 +37,11 @@ The gateway provides tools to:
 * Create and modify smart collections and their filters.
 * Read and update collection summaries, labels, visibility, sort/display settings, posters, and background art.
 * Read and update individual movie and TV show summaries by exact Plex rating key while preserving other item metadata.
+* Replace individual movie and TV show posters by exact Plex rating key from an HTTP/HTTPS URL or a local JPG/JPEG/PNG/WebP image, and lock the selected poster against normal metadata refreshes.
 * Search TV shows and episodes.
 * Create narrowly scoped TV playlists.
+
+Individual item summary and poster tools currently support movie and TV show items only. For poster replacement, `local_filepath` is read from the Windows gateway server. An `image_url` is passed to Plex for retrieval, so it must be reachable by the Plex server.
 
 Plex collection operations do not delete the underlying media files.
 

@@ -1,7 +1,7 @@
 #requires -RunAsAdministrator
 <#
 MediaStack Control Gateway Installer for Windows Server
-v3.4.2 - ITEM SUMMARY METADATA / ARR MANAGEMENT / TAUTULLI REPORTING / COLLECTION METADATA / SELF-HEALING TUNNEL / IDEMPOTENT
+v3.4.3 - ITEM POSTER METADATA / ITEM SUMMARY METADATA / ARR MANAGEMENT / TAUTULLI REPORTING / COLLECTION METADATA / SELF-HEALING TUNNEL / IDEMPOTENT
 
 Safe to run repeatedly.
 
@@ -21,6 +21,7 @@ Behavior:
   * Adds Sonarr, Radarr, and Lidarr reporting, item management, bulk quality/monitor/search workflows, and local inventory exports.
   * v3.4.1 fixes lightweight Arr connectivity status and owner-scoped file enumeration/storage reporting for current Arr APIs.
   * v3.4.2 adds read/write tools for individual movie/show Summary fields while preserving all other item metadata.
+  * v3.4.3 adds individual movie/show poster replacement by exact Plex rating key from an HTTP/HTTPS URL or local image file.
   * Arr deletions require a short-lived prepared confirmation token before the destructive call can execute.
   * New Radarr/Sonarr/Lidarr requests require an explicit root folder/profile instead of guessing storage paths.
 
@@ -431,7 +432,7 @@ function Test-TunnelClient {
     }
 }
 
-Write-Host "MediaStack Control Gateway installer for Windows Server - v3.4.2 ITEM SUMMARY METADATA / ARR MANAGEMENT / TAUTULLI REPORTING / COLLECTION METADATA / SELF-HEALING TUNNEL / IDEMPOTENT" -ForegroundColor Green
+Write-Host "MediaStack Control Gateway installer for Windows Server - v3.4.3 ITEM POSTER METADATA / ITEM SUMMARY METADATA / ARR MANAGEMENT / TAUTULLI REPORTING / COLLECTION METADATA / SELF-HEALING TUNNEL / IDEMPOTENT" -ForegroundColor Green
 Write-Host "Safe to run repeatedly. Existing working components are skipped." -ForegroundColor Green
 Write-Host "HARD NONINTERACTIVE MODE: all PowerShell confirmation prompts are suppressed." -ForegroundColor Green
 Write-Host "Working root: $Root" -ForegroundColor Green
@@ -826,7 +827,7 @@ mcp = MCPServer(
     "MediaStack Control Gateway",
     instructions=(
         "Tools for visibility across all Plex libraries and collections, regular collection "
-        "management, collection metadata management, individual movie/show summary metadata management, smart collection filter management, narrowly "
+        "management, collection metadata management, individual movie/show summary and poster metadata management, smart collection filter management, narrowly "
         "scoped TV episode playlist creation, Tautulli-backed reporting, and Sonarr/Radarr/Lidarr management. "
         "Use plex_reporting_* for Plex analytics and arr_*/sonarr_*/radarr_*/lidarr_* for Arr reporting and management. "
         "Large datasets should be processed locally and summarized before crossing the tunnel. Resolve exact items with read tools "
@@ -1149,13 +1150,13 @@ def _validate_image_source(image_url: Optional[str], local_filepath: Optional[st
 
     local_filepath = os.path.abspath(str(local_filepath).strip())
     if not os.path.isfile(local_filepath):
-        raise ValueError(f"Local image file was not found on the Plex server: {local_filepath}")
+        raise ValueError(f"Local image file was not found on the gateway server: {local_filepath}")
 
     allowed_extensions = {".jpg", ".jpeg", ".png", ".webp"}
     extension = os.path.splitext(local_filepath)[1].lower()
     if extension not in allowed_extensions:
         raise ValueError(
-            "Local collection artwork must be a .jpg, .jpeg, .png, or .webp image."
+            "Local artwork must be a .jpg, .jpeg, .png, or .webp image."
         )
 
     return None, local_filepath
@@ -1580,8 +1581,54 @@ def plex_update_item_summary(
 
 @mcp.tool(
     description=(
+        "Upload or replace the poster for one exact Plex movie or TV show by rating key. Provide exactly one source: "
+        "an http/https image_url, or a local_filepath on the gateway server. Local files are limited to jpg/jpeg/png/webp. "
+        "Only the selected item's poster is changed; title, summary, collections, labels, ratings, files, and all other metadata are preserved. "
+        "The selected poster is locked so a normal metadata refresh does not replace the manual artwork."
+    ),
+    annotations=ToolAnnotations(read_only_hint=False, destructive_hint=False, idempotent_hint=False),
+)
+def plex_set_item_poster(
+    library_name: str,
+    rating_key: str,
+    image_url: Optional[str] = None,
+    local_filepath: Optional[str] = None,
+) -> dict:
+    server = _plex()
+    section = _exact_section(server, library_name)
+    items = _load_rating_key_items(server, section, [rating_key])
+    item = items[0]
+    item.reload()
+
+    item_type = getattr(item, "TYPE", None) or item.__class__.__name__.lower()
+    if item_type not in {"movie", "show"}:
+        raise ValueError("plex_set_item_poster currently supports movie and show items only.")
+
+    image_url, local_filepath = _validate_image_source(image_url, local_filepath)
+    previous_thumb = getattr(item, "thumb", None)
+
+    item.uploadPoster(url=image_url, filepath=local_filepath)
+    item.lockPoster()
+    item.reload()
+
+    return {
+        "changed": True,
+        "library": section.title,
+        "type": item_type,
+        "title": getattr(item, "title", None),
+        "year": getattr(item, "year", None),
+        "rating_key": str(getattr(item, "ratingKey", "")) or None,
+        "previous_thumb": previous_thumb,
+        "thumb": getattr(item, "thumb", None),
+        "poster_locked": True,
+        "source": "url" if image_url else "local_filepath",
+    }
+
+
+@mcp.tool(
+    description=(
         "Upload or replace the poster for one exact Plex collection. Provide exactly one source: an http/https "
-        "image_url, or a local_filepath on the Plex server. Local files are limited to jpg/jpeg/png/webp. "
+        "image_url, or a local_filepath on the gateway server. Local files are limited to jpg/jpeg/png/webp. "
         "This changes collection artwork only and never changes collection membership or underlying media."
     ),
     annotations=ToolAnnotations(read_only_hint=False, destructive_hint=False, idempotent_hint=False),
@@ -1617,7 +1664,7 @@ def plex_set_collection_poster(
 @mcp.tool(
     description=(
         "Upload or replace the background artwork for one exact Plex collection. Provide exactly one source: "
-        "an http/https image_url, or a local_filepath on the Plex server. Local files are limited to "
+        "an http/https image_url, or a local_filepath on the gateway server. Local files are limited to "
         "jpg/jpeg/png/webp. This changes collection artwork only and never changes collection membership or media."
     ),
     annotations=ToolAnnotations(read_only_hint=False, destructive_hint=False, idempotent_hint=False),
@@ -2444,7 +2491,7 @@ def _tautulli_endpoint(cmd: str, params: Optional[dict] = None) -> str:
 
 def _tautulli_api(cmd: str, params: Optional[dict] = None, timeout: int = 60):
     url = _tautulli_endpoint(cmd, params)
-    request = Request(url, headers={"User-Agent": "MediaStack-Control-Gateway/3.4.2"})
+    request = Request(url, headers={"User-Agent": "MediaStack-Control-Gateway/3.4.3"})
     try:
         with urlopen(request, timeout=timeout) as response:
             raw = response.read()
@@ -3058,7 +3105,7 @@ def plex_reporting_export_status(library_name: str, export_id: int) -> dict:
 def _download_export_to_local_cache(export_id: int) -> dict:
     export_id = int(export_id)
     url = _tautulli_endpoint("download_export", {"export_id": export_id})
-    request = Request(url, headers={"User-Agent": "MediaStack-Control-Gateway/3.4.2"})
+    request = Request(url, headers={"User-Agent": "MediaStack-Control-Gateway/3.4.3"})
     try:
         with urlopen(request, timeout=300) as response:
             raw = response.read()
@@ -3313,7 +3360,7 @@ def _arr_api(
     headers = {
         "X-Api-Key": cfg["api_key"],
         "Accept": "application/json",
-        "User-Agent": "MediaStack-Control-Gateway-Arr/3.4.2",
+        "User-Agent": "MediaStack-Control-Gateway-Arr/3.4.3",
     }
     if body is not None:
         data = json.dumps(body).encode("utf-8")
@@ -5034,6 +5081,7 @@ Write-Host "Working stages will report SKIP; only missing/broken stages will be 
 Write-Host "SELF-HEALING ENABLED: tunnel-client restarts automatically after exit, and a watchdog checks /readyz every minute." -ForegroundColor Green
 Write-Host "COLLECTION METADATA ENABLED: read/update summaries, sort/display settings, labels, visibility, posters, and background art." -ForegroundColor Green
 Write-Host "ITEM SUMMARY METADATA ENABLED: read/update movie and TV show summaries by exact Plex rating key; edits are locked and preserve all other metadata." -ForegroundColor Green
+Write-Host "ITEM POSTER METADATA ENABLED: replace individual movie and TV show posters by exact Plex rating key from URL or local image; selected posters are locked." -ForegroundColor Green
 Write-Host "TAUTULLI REPORTING ENABLED: cached library counts, logical storage, media breakdowns, history/top stats, and local CSV/JSON exports." -ForegroundColor Green
 Write-Host "REPORTING DESIGN: normal questions return compact aggregates; full inventory data crosses the tunnel only when an export is explicitly requested." -ForegroundColor Green
 Write-Host "ARR MANAGEMENT ENABLED: Sonarr/Radarr/Lidarr reporting, adds/edits, explicit-path requests, bulk monitor/profile/search workflows, and inventory exports." -ForegroundColor Green
