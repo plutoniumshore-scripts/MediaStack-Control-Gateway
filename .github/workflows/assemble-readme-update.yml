@@ -1,0 +1,40 @@
+name: Assemble README update
+
+on:
+  push:
+    branches:
+      - gateway-v3.4.10-update
+    paths:
+      - .github/workflows/assemble-readme-update.yml
+
+permissions:
+  contents: write
+
+jobs:
+  assemble:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out update branch
+        uses: actions/checkout@v4
+        with:
+          ref: gateway-v3.4.10-update
+          fetch-depth: 0
+
+      - name: Reconstruct validated README
+        shell: bash
+        run: |
+          set -euo pipefail
+          cat .publish-readme/readme.part* | base64 -d | gzip -d > README.md
+          echo "945e72f074c3a9b5c0c7bb746b740cd008d4fa3c9579bab7dfd49ec516d9b7d4  README.md" | sha256sum -c -
+          rm -rf .publish-readme
+          rm -f .github/workflows/assemble-readme-update.yml
+
+      - name: Commit reconstructed README
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          git commit -m "Assemble gateway README"
+          git push origin HEAD:gateway-v3.4.10-update
