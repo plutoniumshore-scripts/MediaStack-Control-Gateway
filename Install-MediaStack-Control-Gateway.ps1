@@ -1,34 +1,33 @@
 #requires -RunAsAdministrator
 <#
 MediaStack Control Gateway Installer for Windows Server
-v3.4.3 - ITEM POSTER METADATA / ITEM SUMMARY METADATA / ARR MANAGEMENT / TAUTULLI REPORTING / COLLECTION METADATA / SELF-HEALING TUNNEL / IDEMPOTENT
+v3.4.10 - WATCHDOG + LOG ROTATION / TUNNEL DIAGNOSTICS / ARR STATUS + COLORING / INSTALLER LOGGING / HUB CACHE REFRESH / ADDED AT METADATA / EPISODE METADATA / ITEM POSTER METADATA / ITEM SUMMARY METADATA / ARR MANAGEMENT / TAUTULLI REPORTING / COLLECTION METADATA / SELF-HEALING TUNNEL / IDEMPOTENT
 
 Safe to run repeatedly.
 
 Behavior:
-  * Reuses a working tunnel-client.
-  * Reuses the fixed local Python installation.
-  * Installs Python packages only if imports fail.
-  * Rewrites the MCP server only when its content changed.
-  * Reuses a healthy tunnel profile.
-  * Recreates the tunnel profile only if it is missing/broken/stale.
-  * Reuses the scheduled task when its action is already correct.
-  * Starts the tunnel only when it is not already running.
-  * Keeps generated PS1/Python/config files editable by the invoking Windows user while retaining restricted ACLs.
-  * Adds collection metadata read/write tools for summaries, sort/display settings, labels, visibility, posters, and background art.
-  * Adds Tautulli-backed read-only reporting for library counts, logical storage, media breakdowns, history, and top statistics.
-  * Adds Tautulli export tools so full CSV/JSON inventory exports can be generated locally and transferred in chunks only when requested.
-  * Adds Sonarr, Radarr, and Lidarr reporting, item management, bulk quality/monitor/search workflows, and local inventory exports.
-  * v3.4.1 fixes lightweight Arr connectivity status and owner-scoped file enumeration/storage reporting for current Arr APIs.
-  * v3.4.2 adds read/write tools for individual movie/show Summary fields while preserving all other item metadata.
-  * v3.4.3 adds individual movie/show poster replacement by exact Plex rating key from an HTTP/HTTPS URL or local image file.
+  * Reuses a working tunnel-client and application-local Python installation.
+  * Installs Python packages only when imports fail.
+  * Rewrites the generated MCP server only when its content changes.
+  * Reuses or repairs the tunnel profile and Scheduled Tasks as needed.
+  * Keeps generated PowerShell/Python/config files editable by the invoking Windows user while retaining restricted ACLs.
+  * Provides Plex library, collection, smart-collection, metadata, artwork, episode, playlist, addedAt/Touch, and transient-hub tools.
+  * Provides Tautulli-backed reporting and controlled local CSV/JSON export workflows.
+  * Provides Sonarr, Radarr, and Lidarr reporting and controlled management workflows.
+  * v3.4.4 adds read/write metadata tools for individual TV episodes.
+  * v3.4.5 adds addedAt metadata controls for movies, shows, seasons, and episodes for Recently Added ordering.
+  * v3.4.6 adds non-destructive Plex transient-hub refresh/warm plus Recently Added verification.
+  * v3.4.7 adds timestamped full installer transcript logging.
+  * v3.4.8 fixes current nested Arr status parsing and normalizes console severity colors.
+  * v3.4.9 adds read-only tunnel timing and bounded runtime diagnostics.
+  * v3.4.10 separates tunnel liveness from readiness to prevent restart storms, adds readiness thresholds/cooldowns/startup grace, bounded UTF-8 runtime/watchdog logs, installer-log retention, a clearly named health endpoint state file, and a dynamic local admin UI launcher.
   * Arr deletions require a short-lived prepared confirmation token before the destructive call can execute.
   * New Radarr/Sonarr/Lidarr requests require an explicit root folder/profile instead of guessing storage paths.
 
 By default, working files live under:
   C:\Scripts\MediaStack-Control-Gateway
 
-The install root can be changed in the local configuration file.
+The install root and operational thresholds can be changed in the local configuration file.
 
 This script is intentionally NONINTERACTIVE.
 
@@ -56,6 +55,18 @@ $PSDefaultParameterValues['Remove-Item:Force'] = $true
 $PSDefaultParameterValues['Set-Content:Force'] = $true
 
 [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+
+# Normalize severity colors for the interactive installer console. Neutral data
+# remains at the host default color. These assignments are best-effort because
+# some non-console hosts do not expose mutable PrivateData color properties.
+try {
+    if ($null -ne $Host.PrivateData) {
+        $Host.PrivateData.WarningForegroundColor = 'Yellow'
+        $Host.PrivateData.ErrorForegroundColor = 'Red'
+    }
+}
+catch {
+}
 
 # ===========================================================================
 # Local configuration
@@ -94,6 +105,21 @@ else {
     $Root = 'C:\Scripts\MediaStack-Control-Gateway'
 }
 
+function Get-OptionalPositiveInt {
+    param(
+        [Parameter(Mandatory=$true)][string]$Name,
+        [Parameter(Mandatory=$true)][int]$Default
+    )
+    if (-not $Config.ContainsKey($Name) -or $null -eq $Config[$Name] -or [string]::IsNullOrWhiteSpace([string]$Config[$Name])) {
+        return $Default
+    }
+    $value = 0
+    if (-not [int]::TryParse([string]$Config[$Name], [ref]$value) -or $value -lt 1) {
+        throw "Optional configuration field '$Name' must be a positive integer."
+    }
+    return $value
+}
+
 # ===========================================================================
 # Fixed paths
 # ===========================================================================
@@ -102,7 +128,22 @@ $DownloadDir = Join-Path $Root 'downloads'
 $ProfileDir = Join-Path $Root 'profiles'
 $LogDir = Join-Path $Root 'logs'
 $ReportingExportDir = Join-Path $Root 'reporting-exports'
-$HealthUrlFile = Join-Path $LogDir 'tunnel-health.url'
+$HealthUrlFile = Join-Path $LogDir 'tunnel-health-endpoint.txt'
+$LegacyHealthUrlFile = Join-Path $LogDir 'tunnel-health.url'
+$WatchdogStateFile = Join-Path $LogDir 'tunnel-watchdog-state.json'
+$OpenTunnelUiScript = Join-Path $Root 'Open-Tunnel-UI.ps1'
+
+# Managed log/watchdog policy. Defaults are conservative and can be overridden
+# in the local configuration file.
+$RuntimeLogMaxBytes = (Get-OptionalPositiveInt -Name 'RuntimeLogMaxMB' -Default 25) * 1MB
+$RuntimeLogRetainedFiles = Get-OptionalPositiveInt -Name 'RuntimeLogRetainedFiles' -Default 3
+$WatchdogLogMaxBytes = (Get-OptionalPositiveInt -Name 'WatchdogLogMaxMB' -Default 5) * 1MB
+$WatchdogLogRetainedFiles = Get-OptionalPositiveInt -Name 'WatchdogLogRetainedFiles' -Default 3
+$InstallerLogRetainCount = Get-OptionalPositiveInt -Name 'InstallerLogRetainCount' -Default 10
+$WatchdogReadinessFailureThreshold = Get-OptionalPositiveInt -Name 'WatchdogReadinessFailureThreshold' -Default 3
+$WatchdogReadinessRestartCooldownMinutes = Get-OptionalPositiveInt -Name 'WatchdogReadinessRestartCooldownMinutes' -Default 10
+$WatchdogStartupGraceSeconds = Get-OptionalPositiveInt -Name 'WatchdogStartupGraceSeconds' -Default 90
+$WatchdogHealthyHeartbeatMinutes = Get-OptionalPositiveInt -Name 'WatchdogHealthyHeartbeatMinutes' -Default 60
 # Python is deliberately application-local. We use the official CPython NuGet
 # distribution instead of the Windows MSI/bootstrapper, so there is no Windows
 # installation state, registry entry, maintenance mode, or reboot dependency.
@@ -118,6 +159,47 @@ $TaskName = 'MediaStack Control Gateway Tunnel'
 $WatchdogTaskName = 'MediaStack Control Gateway Tunnel Watchdog'
 $ProfileName = 'media-stack'
 $TotalStages = 12
+
+# ===========================================================================
+# Timestamped installer transcript logging
+# ===========================================================================
+# Capture the complete installer console stream, including warnings and errors,
+# so installation problems can be reviewed after the PowerShell window closes.
+# This is separate from the tunnel runtime/watchdog/doctor logs below.
+if (-not (Test-Path -LiteralPath $LogDir)) {
+    New-Item -ItemType Directory -Path $LogDir -Force -Confirm:$false | Out-Null
+}
+
+$InstallerTimestamp = Get-Date -Format 'yyyyMMdd-HHmmss'
+$InstallerLog = Join-Path $LogDir ("installer-{0}.log" -f $InstallerTimestamp)
+$InstallerTranscriptActive = $false
+
+try {
+    Start-Transcript -Path $InstallerLog -Force -ErrorAction Stop | Out-Null
+    $InstallerTranscriptActive = $true
+}
+catch {
+    # Logging must never prevent the installer itself from running.
+    Write-Warning "Unable to start installer transcript logging at '$InstallerLog': $($_.Exception.Message)"
+}
+
+# Retain only the newest managed installer transcripts. Neutral historical logs
+# with other names are left untouched.
+try {
+    $oldInstallerLogs = @(
+        Get-ChildItem -LiteralPath $LogDir -Filter 'installer-*.log' -File -ErrorAction SilentlyContinue |
+            Sort-Object LastWriteTime -Descending |
+            Select-Object -Skip $InstallerLogRetainCount
+    )
+    foreach ($oldInstallerLog in $oldInstallerLogs) {
+        Remove-Item -LiteralPath $oldInstallerLog.FullName -Force -Confirm:$false -ErrorAction SilentlyContinue
+    }
+}
+catch {
+    Write-Warning "Installer log retention cleanup could not complete: $($_.Exception.Message)"
+}
+
+try {
 
 function Expand-ZipNoPrompt {
     param(
@@ -167,23 +249,57 @@ function Get-TunnelHealthBaseUrl {
     return $null
 }
 
-function Test-TunnelReady {
+function Get-TunnelLocalProbe {
+    param(
+        [Parameter(Mandatory=$true)][ValidateSet('/healthz','/readyz')][string]$Path,
+        [int]$TimeoutSeconds = 3
+    )
+
     $baseUrl = Get-TunnelHealthBaseUrl
     if (-not $baseUrl) {
-        return $false
+        return [pscustomobject]@{ Ok = $false; StatusCode = $null; Body = ''; Error = 'Health endpoint file is missing or invalid.'; BaseUrl = $null }
     }
 
     try {
-        $response = Invoke-WebRequest `
-            -UseBasicParsing `
-            -Uri ($baseUrl + '/readyz') `
-            -TimeoutSec 3 `
-            -ErrorAction Stop
-        return ($response.StatusCode -eq 200)
+        $response = Invoke-WebRequest -UseBasicParsing -Uri ($baseUrl + $Path) -TimeoutSec $TimeoutSeconds -ErrorAction Stop
+        return [pscustomobject]@{
+            Ok = ($response.StatusCode -eq 200)
+            StatusCode = [int]$response.StatusCode
+            Body = [string]$response.Content
+            Error = $null
+            BaseUrl = $baseUrl
+        }
     }
     catch {
-        return $false
+        $statusCode = $null
+        $body = ''
+        if ($null -ne $_.Exception.Response) {
+            try { $statusCode = [int]$_.Exception.Response.StatusCode } catch { }
+            try {
+                $stream = $_.Exception.Response.GetResponseStream()
+                if ($null -ne $stream) {
+                    $reader = New-Object System.IO.StreamReader($stream)
+                    try { $body = $reader.ReadToEnd() } finally { $reader.Dispose() }
+                }
+            }
+            catch { }
+        }
+        return [pscustomobject]@{
+            Ok = $false
+            StatusCode = $statusCode
+            Body = $body
+            Error = $_.Exception.Message
+            BaseUrl = $baseUrl
+        }
     }
+}
+
+function Test-TunnelHealth {
+    return [bool](Get-TunnelLocalProbe -Path '/healthz' -TimeoutSeconds 3).Ok
+}
+
+function Test-TunnelReady {
+    return [bool](Get-TunnelLocalProbe -Path '/readyz' -TimeoutSeconds 3).Ok
 }
 
 function Wait-TunnelReady {
@@ -227,14 +343,20 @@ function Show-Stage {
     Write-Host "=== [$Number/$TotalStages] $Text ===" -ForegroundColor Cyan
 }
 
+function Write-Good {
+    param([Parameter(Mandatory=$true)][string]$Text)
+    Write-Host "OK  : $Text" -ForegroundColor Green
+}
+
 function Write-Skip {
     param([Parameter(Mandatory=$true)][string]$Text)
-    Write-Host "SKIP: $Text" -ForegroundColor DarkGreen
+    Write-Host "SKIP: $Text" -ForegroundColor Green
 }
 
 function Write-Fix {
     param([Parameter(Mandatory=$true)][string]$Text)
-    Write-Host "FIX : $Text" -ForegroundColor Yellow
+    # A corrective action is informational, not a warning.
+    Write-Host "INFO: $Text" -ForegroundColor Cyan
 }
 
 function Assert-ExitCode {
@@ -302,7 +424,7 @@ function Set-SecureAcl {
         return
     }
 
-    # Configuration and generated runtime files can contain credentials, so keep them restricted to
+    # These files can contain embedded credentials, so keep them restricted to
     # SYSTEM, local Administrators, and the Windows account running this installer.
     # Previous versions granted only SYSTEM + Administrators. With UAC, that could
     # make the files appear read-only when the same admin user opened an editor
@@ -432,8 +554,9 @@ function Test-TunnelClient {
     }
 }
 
-Write-Host "MediaStack Control Gateway installer for Windows Server - v3.4.3 ITEM POSTER METADATA / ITEM SUMMARY METADATA / ARR MANAGEMENT / TAUTULLI REPORTING / COLLECTION METADATA / SELF-HEALING TUNNEL / IDEMPOTENT" -ForegroundColor Green
+Write-Host "MediaStack Control Gateway installer for Windows Server - v3.4.10 WATCHDOG + LOG ROTATION / TUNNEL DIAGNOSTICS / ARR STATUS + COLORING / INSTALLER LOGGING / HUB CACHE REFRESH / ADDED AT METADATA / EPISODE METADATA / ITEM POSTER METADATA / ITEM SUMMARY METADATA / ARR MANAGEMENT / TAUTULLI REPORTING / COLLECTION METADATA / SELF-HEALING TUNNEL / IDEMPOTENT" -ForegroundColor Green
 Write-Host "Safe to run repeatedly. Existing working components are skipped." -ForegroundColor Green
+Write-Host "Installer log: $InstallerLog" -ForegroundColor Green
 Write-Host "HARD NONINTERACTIVE MODE: all PowerShell confirmation prompts are suppressed." -ForegroundColor Green
 Write-Host "Working root: $Root" -ForegroundColor Green
 
@@ -599,7 +722,7 @@ else {
         if ($actual -ne $expected) {
             throw "Tunnel-client SHA256 verification failed for $zipPath."
         }
-        Write-Host 'SHA256 verification passed.'
+        Write-Good 'SHA256 verification passed.'
     }
 
     $extractDir = Join-Path $DownloadDir 'tunnel-client-extracted'
@@ -729,7 +852,7 @@ else {
         throw "Portable Python $pythonVersion is present at $PythonExe, but 'python -m pip' is not available. The official NuGet package should contain pip."
     }
 
-    Write-Host "Portable Python ready: $pythonVersion at $PythonExe"
+    Write-Good "Portable Python ready: $pythonVersion at $PythonExe"
     Write-Skip "Verified executable directly: $PythonExe"
     Write-Progress -Id 3 -ParentId 1 -Activity 'Portable Python' -Status 'Ready' -PercentComplete 100 -Completed
 }
@@ -796,6 +919,7 @@ import re
 import secrets
 import time
 import uuid
+from datetime import datetime
 from pathlib import Path
 from typing import Optional
 from urllib.error import HTTPError, URLError
@@ -819,15 +943,17 @@ RADARR_API_KEY = "__RADARR_API_KEY__"
 LIDARR_URL = "__LIDARR_URL__"
 LIDARR_API_KEY = "__LIDARR_API_KEY__"
 REPORT_EXPORT_DIR = "__REPORT_EXPORT_DIR__"
+TUNNEL_RUNTIME_LOG = "__TUNNEL_RUNTIME_LOG__"
+TUNNEL_HEALTH_URL_FILE = "__TUNNEL_HEALTH_URL_FILE__"
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("media-stack-control-gateway")
 
 mcp = MCPServer(
-    "MediaStack Control Gateway",
+    "Plex",
     instructions=(
         "Tools for visibility across all Plex libraries and collections, regular collection "
-        "management, collection metadata management, individual movie/show summary and poster metadata management, smart collection filter management, narrowly "
+        "management, collection metadata management, individual movie/show summary and poster metadata management, movie/show/season/episode added-at metadata management, non-destructive Plex transient-hub refresh and Recently Added verification, individual TV episode metadata management, read-only tunnel timing/runtime diagnostics, smart collection filter management, narrowly "
         "scoped TV episode playlist creation, Tautulli-backed reporting, and Sonarr/Radarr/Lidarr management. "
         "Use plex_reporting_* for Plex analytics and arr_*/sonarr_*/radarr_*/lidarr_* for Arr reporting and management. "
         "Large datasets should be processed locally and summarized before crossing the tunnel. Resolve exact items with read tools "
@@ -878,10 +1004,11 @@ def _item_summary(item, library_name: Optional[str] = None) -> dict:
         ("parentIndex", "parent_index"),
         ("index", "index"),
         ("originallyAvailableAt", "originally_available_at"),
+        ("addedAt", "added_at"),
     ):
         value = getattr(item, source_name, None)
         if value is not None:
-            if source_name == "originallyAvailableAt" and hasattr(value, "isoformat"):
+            if source_name in {"originallyAvailableAt", "addedAt"} and hasattr(value, "isoformat"):
                 value = value.isoformat()
             result[output_name] = value
 
@@ -924,7 +1051,12 @@ def _collection_exists(section, collection_title: str) -> bool:
     )
 
 
-def _load_rating_key_items(server: PlexServer, section, rating_keys: list[str]) -> list:
+def _load_rating_key_items(
+    server: PlexServer,
+    section,
+    rating_keys: list[str],
+    require_same_type: bool = True,
+) -> list:
     if not rating_keys:
         raise ValueError("At least one Plex rating key is required.")
 
@@ -963,7 +1095,7 @@ def _load_rating_key_items(server: PlexServer, section, rating_keys: list[str]) 
         raise ValueError(f"These Plex rating keys could not be found: {', '.join(missing)}")
 
     item_types = {getattr(item, "type", None) for item in items}
-    if len(item_types) != 1:
+    if require_same_type and len(item_types) != 1:
         raise ValueError(
             "A regular Plex collection cannot mix different media item types in one collection."
         )
@@ -1150,7 +1282,7 @@ def _validate_image_source(image_url: Optional[str], local_filepath: Optional[st
 
     local_filepath = os.path.abspath(str(local_filepath).strip())
     if not os.path.isfile(local_filepath):
-        raise ValueError(f"Local image file was not found on the gateway server: {local_filepath}")
+        raise ValueError(f"Local image file was not found on the Plex server: {local_filepath}")
 
     allowed_extensions = {".jpg", ".jpeg", ".png", ".webp"}
     extension = os.path.splitext(local_filepath)[1].lower()
@@ -1184,6 +1316,142 @@ def plex_status() -> dict:
         ],
         "tv_libraries": [section.title for section in sections if getattr(section, "type", None) == "show"],
     }
+
+
+def _redact_tunnel_log_line(line: str) -> str:
+    text = str(line or "")
+    text = re.sub(r"sk-[A-Za-z0-9_-]{12,}", "sk-[REDACTED]", text)
+    text = re.sub(
+        r"(?i)((?:authorization|api[_-]?key|token)[\"'\s:=]+)([^\"'\s,}]+)",
+        lambda m: m.group(1) + "[REDACTED]",
+        text,
+    )
+    return text[:2000]
+
+
+def _local_tunnel_probe(path: str, timeout: int = 3) -> dict:
+    if not os.path.isfile(TUNNEL_HEALTH_URL_FILE):
+        return {"available": False, "error": "Tunnel health endpoint file does not exist."}
+    try:
+        base = Path(TUNNEL_HEALTH_URL_FILE).read_text(encoding="utf-8-sig").strip().rstrip("/")
+    except Exception as exc:
+        return {"available": False, "error": f"Could not read tunnel health endpoint file: {exc}"}
+    if not re.match(r"^http://127\.0\.0\.1:\d+$", base):
+        return {"available": False, "error": "Tunnel health endpoint file did not contain a valid loopback URL."}
+    try:
+        with urlopen(Request(base + path, headers={"User-Agent": "MediaStack-Control-Gateway-Diagnostics/3.4.10"}), timeout=timeout) as response:
+            raw = response.read(4096).decode("utf-8", errors="replace")
+            return {"available": True, "status_code": int(response.status), "body": raw[:1000]}
+    except HTTPError as exc:
+        try:
+            body = exc.read(4096).decode("utf-8", errors="replace")
+        except Exception:
+            body = ""
+        return {"available": True, "status_code": int(exc.code), "body": body[:1000], "error": str(exc.reason)}
+    except Exception as exc:
+        return {"available": False, "error": str(exc)}
+
+
+@mcp.tool(
+    description=(
+        "Read-only tunnel timing diagnostic. Sleeps locally inside the MCP tool for the requested number of seconds "
+        "and then returns the measured elapsed time. It does not contact or modify Plex. Use controlled values to "
+        "measure the effective ChatGPT/tunnel command-response deadline; if the outer gateway times out first, this "
+        "tool may return a gateway error instead of a result. Delay is capped at 120 seconds."
+    ),
+    annotations=ToolAnnotations(read_only_hint=True, idempotent_hint=True),
+)
+def plex_tunnel_delay_test(delay_seconds: int = 5) -> dict:
+    seconds = max(0, min(int(delay_seconds), 120))
+    started_wall = datetime.now().astimezone().isoformat()
+    started = time.monotonic()
+    time.sleep(seconds)
+    elapsed = time.monotonic() - started
+    return {
+        "completed": True,
+        "requested_seconds": seconds,
+        "elapsed_seconds": round(elapsed, 3),
+        "started_at": started_wall,
+        "finished_at": datetime.now().astimezone().isoformat(),
+        "note": "No Plex, Arr, Tautulli, filesystem, or metadata changes were made.",
+    }
+
+
+@mcp.tool(
+    description=(
+        "Read-only local tunnel diagnostics. Summarizes recent tunnel-runtime log events relevant to 502s, response "
+        "deadlines, connection TTL, transport closure, process exits/restarts, and timeouts, and probes local /healthz "
+        "and /readyz. Returns only a bounded redacted diagnostic summary and does not modify the tunnel or Plex."
+    ),
+    annotations=ToolAnnotations(read_only_hint=True, idempotent_hint=True),
+)
+def plex_tunnel_runtime_diagnostics(max_log_lines: int = 2000, max_events: int = 50) -> dict:
+    max_log_lines = max(100, min(int(max_log_lines), 10000))
+    max_events = max(1, min(int(max_events), 200))
+    result = {
+        "runtime_log": TUNNEL_RUNTIME_LOG,
+        "runtime_log_exists": os.path.isfile(TUNNEL_RUNTIME_LOG),
+        "health": _local_tunnel_probe("/healthz"),
+        "ready": _local_tunnel_probe("/readyz"),
+        "configured_by_installer": {
+            "mcp_connection_max_ttl_override": None,
+            "runtime_log_max_bytes": 25 * 1024 * 1024,
+            "runtime_log_retained_files": 3,
+            "watchdog_log_max_bytes": 5 * 1024 * 1024,
+            "watchdog_log_retained_files": 3,
+            "watchdog_readiness_failure_threshold": 3,
+            "watchdog_readiness_restart_cooldown_minutes": 10,
+            "watchdog_startup_grace_seconds": 90,
+            "health_endpoint_file": TUNNEL_HEALTH_URL_FILE,
+            "note": "Installer does not override mcp.connection_max_ttl; tunnel-client default applies. Watchdog separates /healthz liveness from /readyz readiness and uses bounded restart behavior.",
+        },
+    }
+    if not result["runtime_log_exists"]:
+        result["event_counts"] = {}
+        result["recent_events"] = []
+        return result
+
+    try:
+        with open(TUNNEL_RUNTIME_LOG, "r", encoding="utf-8-sig", errors="replace") as handle:
+            lines = handle.readlines()[-max_log_lines:]
+    except Exception as exc:
+        result["log_error"] = str(exc)
+        result["event_counts"] = {}
+        result["recent_events"] = []
+        return result
+
+    categories = {
+        "http_502": (" 502", "\"502\"", "status=502", "resp_code=502"),
+        "response_deadline": ("response deadline", "deadline reached", "response_timeout"),
+        "connection_ttl": ("connection ttl", "max ttl", "connection_max_ttl"),
+        "transport_closed": ("transport_closed", "closed pipe", "file already closed", "connection closed"),
+        "timeout": ("timeout", "timed out", "deadline exceeded"),
+        "process_exit": ("tunnel-client exited", "requesting tunnel-client shutdown", "supervisor caught exception"),
+        "restart": ("restarting in", "starting tunnel-client", "tunnel supervisor started"),
+    }
+    counts = {key: 0 for key in categories}
+    events = []
+    for raw in lines:
+        lower = raw.casefold()
+        matched = []
+        for category, needles in categories.items():
+            if any(needle.casefold() in lower for needle in needles):
+                counts[category] += 1
+                matched.append(category)
+        if matched:
+            events.append({"categories": matched, "line": _redact_tunnel_log_line(raw.rstrip())})
+
+    try:
+        stat = os.stat(TUNNEL_RUNTIME_LOG)
+        result["runtime_log_size_bytes"] = int(stat.st_size)
+        result["runtime_log_modified_at"] = datetime.fromtimestamp(stat.st_mtime).astimezone().isoformat()
+    except Exception:
+        pass
+    result["lines_scanned"] = len(lines)
+    result["event_counts"] = counts
+    result["recent_events"] = events[-max_events:]
+    result["note"] = "Diagnostic only; no service restart, cache clear, scan, metadata write, or filesystem mutation was performed."
+    return result
 
 
 @mcp.tool(
@@ -1579,10 +1847,513 @@ def plex_update_item_summary(
     }
 
 
+
+@mcp.tool(
+    description=(
+        "Read editable metadata for one exact Plex TV episode by rating key. Returns title, Summary, "
+        "original air/release date, content rating, episode number, season number, show identity, and field lock states. "
+        "This tool is read-only."
+    ),
+    annotations=ToolAnnotations(read_only_hint=True, idempotent_hint=True),
+)
+def plex_get_episode_metadata(
+    library_name: str,
+    rating_key: str,
+) -> dict:
+    server = _plex()
+    section = _exact_section(server, library_name)
+    if getattr(section, "type", None) != "show":
+        raise ValueError(f"Library '{section.title}' is not a TV library.")
+
+    items = _load_rating_key_items(server, section, [rating_key])
+    item = items[0]
+    item.reload()
+
+    item_type = getattr(item, "TYPE", None) or item.__class__.__name__.lower()
+    if item_type != "episode":
+        raise ValueError("plex_get_episode_metadata requires an individual TV episode rating key.")
+
+    aired = getattr(item, "originallyAvailableAt", None)
+    if aired is not None and hasattr(aired, "date"):
+        aired = aired.date().isoformat()
+    elif aired is not None and hasattr(aired, "isoformat"):
+        aired = aired.isoformat()
+
+    season_number = getattr(item, "parentIndex", None)
+    episode_number = getattr(item, "index", None)
+
+    return {
+        "library": section.title,
+        "type": item_type,
+        "show": getattr(item, "grandparentTitle", None),
+        "season": season_number,
+        "episode": episode_number,
+        "code": (
+            f"S{int(season_number):02d}E{int(episode_number):02d}"
+            if season_number is not None and episode_number is not None
+            else None
+        ),
+        "title": getattr(item, "title", None),
+        "summary": getattr(item, "summary", None) or "",
+        "originally_available_at": aired,
+        "content_rating": getattr(item, "contentRating", None),
+        "rating_key": str(getattr(item, "ratingKey", "")) or None,
+        "field_locks": _field_lock_states(item),
+    }
+
+
+@mcp.tool(
+    description=(
+        "Update editable metadata for one exact Plex TV episode by rating key. Every metadata field is optional and omitted fields are preserved. "
+        "Supports title, Summary, original air/release date (YYYY-MM-DD), content rating, and episode number within the current season. "
+        "Changed fields are locked so normal Plex metadata refreshes do not overwrite the manual values. "
+        "This does not rename or move media files and does not change the episode's season assignment."
+    ),
+    annotations=ToolAnnotations(read_only_hint=False, destructive_hint=False, idempotent_hint=True),
+)
+def plex_update_episode_metadata(
+    library_name: str,
+    rating_key: str,
+    title: Optional[str] = None,
+    summary: Optional[str] = None,
+    originally_available_at: Optional[str] = None,
+    content_rating: Optional[str] = None,
+    episode_number: Optional[int] = None,
+) -> dict:
+    if all(
+        value is None
+        for value in (title, summary, originally_available_at, content_rating, episode_number)
+    ):
+        raise ValueError("At least one episode metadata field must be supplied.")
+
+    server = _plex()
+    section = _exact_section(server, library_name)
+    if getattr(section, "type", None) != "show":
+        raise ValueError(f"Library '{section.title}' is not a TV library.")
+
+    items = _load_rating_key_items(server, section, [rating_key])
+    item = items[0]
+    item.reload()
+
+    item_type = getattr(item, "TYPE", None) or item.__class__.__name__.lower()
+    if item_type != "episode":
+        raise ValueError("plex_update_episode_metadata requires an individual TV episode rating key.")
+
+    desired_title = None if title is None else str(title)
+    desired_summary = None if summary is None else str(summary)
+    desired_content_rating = None if content_rating is None else str(content_rating)
+
+    desired_airdate = None
+    if originally_available_at is not None:
+        desired_airdate = str(originally_available_at).strip()
+        if not re.fullmatch(r"\d{4}-\d{2}-\d{2}", desired_airdate):
+            raise ValueError("originally_available_at must use YYYY-MM-DD format.")
+        try:
+            time.strptime(desired_airdate, "%Y-%m-%d")
+        except ValueError as exc:
+            raise ValueError("originally_available_at is not a valid calendar date.") from exc
+
+    desired_episode_number = None
+    if episode_number is not None:
+        try:
+            desired_episode_number = int(episode_number)
+        except Exception as exc:
+            raise ValueError("episode_number must be an integer.") from exc
+        if desired_episode_number < 0:
+            raise ValueError("episode_number cannot be negative.")
+
+    current_airdate = getattr(item, "originallyAvailableAt", None)
+    if current_airdate is not None and hasattr(current_airdate, "date"):
+        current_airdate = current_airdate.date().isoformat()
+    elif current_airdate is not None and hasattr(current_airdate, "isoformat"):
+        current_airdate = current_airdate.isoformat()
+
+    changes = []
+    if desired_title is not None and (getattr(item, "title", None) or "") != desired_title:
+        changes.append("title")
+    if desired_summary is not None and (getattr(item, "summary", None) or "") != desired_summary:
+        changes.append("summary")
+    if desired_airdate is not None and current_airdate != desired_airdate:
+        changes.append("originally_available_at")
+    if desired_content_rating is not None and (getattr(item, "contentRating", None) or "") != desired_content_rating:
+        changes.append("content_rating")
+    if desired_episode_number is not None and getattr(item, "index", None) != desired_episode_number:
+        changes.append("episode_number")
+
+    if changes:
+        item.batchEdits()
+        if "title" in changes:
+            item.editTitle(desired_title, locked=True)
+        if "summary" in changes:
+            item.editSummary(desired_summary, locked=True)
+        if "originally_available_at" in changes:
+            item.editOriginallyAvailable(desired_airdate, locked=True)
+        if "content_rating" in changes:
+            item.editContentRating(desired_content_rating, locked=True)
+        if "episode_number" in changes:
+            # Plex exposes an episode's number as the editable index field. PlexAPI does
+            # not currently wrap this scalar with an editEpisodeNumber helper, so use
+            # the same low-level batch-edit keys that Plex itself accepts.
+            item._edits["index.value"] = desired_episode_number
+            item._edits["index.locked"] = 1
+        item.saveEdits()
+        item.reload()
+
+    aired = getattr(item, "originallyAvailableAt", None)
+    if aired is not None and hasattr(aired, "date"):
+        aired = aired.date().isoformat()
+    elif aired is not None and hasattr(aired, "isoformat"):
+        aired = aired.isoformat()
+
+    season_number = getattr(item, "parentIndex", None)
+    resulting_episode_number = getattr(item, "index", None)
+
+    return {
+        "changed": bool(changes),
+        "changed_fields": changes,
+        "library": section.title,
+        "type": item_type,
+        "show": getattr(item, "grandparentTitle", None),
+        "season": season_number,
+        "episode": resulting_episode_number,
+        "code": (
+            f"S{int(season_number):02d}E{int(resulting_episode_number):02d}"
+            if season_number is not None and resulting_episode_number is not None
+            else None
+        ),
+        "title": getattr(item, "title", None),
+        "summary": getattr(item, "summary", None) or "",
+        "originally_available_at": aired,
+        "content_rating": getattr(item, "contentRating", None),
+        "rating_key": str(getattr(item, "ratingKey", "")) or None,
+        "field_locks": _field_lock_states(item),
+    }
+
+
+def _added_at_iso(unix_timestamp: int) -> str:
+    return datetime.fromtimestamp(int(unix_timestamp)).astimezone().isoformat()
+
+
+def _parse_added_at_value(added_at: Optional[str]) -> tuple[int, str]:
+    if added_at is None or not str(added_at).strip() or str(added_at).strip().casefold() == "now":
+        value = int(time.time())
+        return value, "now"
+
+    raw = str(added_at).strip()
+    if re.fullmatch(r"\d{9,12}", raw):
+        value = int(raw)
+        if value <= 0:
+            raise ValueError("added_at unix timestamp must be greater than zero.")
+        return value, "unix"
+
+    try:
+        if re.fullmatch(r"\d{4}-\d{2}-\d{2}", raw):
+            parsed = datetime.strptime(raw, "%Y-%m-%d")
+            return int(round(parsed.timestamp())), "date"
+
+        normalized = raw[:-1] + "+00:00" if raw.endswith("Z") else raw
+        parsed = datetime.fromisoformat(normalized)
+        return int(round(parsed.timestamp())), "iso_datetime"
+    except ValueError as exc:
+        raise ValueError(
+            "added_at must be 'now', a unix timestamp, YYYY-MM-DD, or an ISO-8601 date/time."
+        ) from exc
+
+
+def _normalize_rating_keys(rating_keys: list[str]) -> list[str]:
+    normalized = []
+    seen = set()
+    for raw_key in rating_keys:
+        key = str(raw_key).strip()
+        if not key:
+            continue
+        if key in seen:
+            continue
+        seen.add(key)
+        normalized.append(key)
+    if not normalized:
+        raise ValueError("At least one Plex rating key is required.")
+    return normalized
+
+
+def _set_added_at_for_items(
+    items: list,
+    base_timestamp: int,
+    stagger_seconds: int,
+    locked: bool,
+) -> list[dict]:
+    allowed_types = {"movie", "show", "season", "episode"}
+    stagger_seconds = int(stagger_seconds)
+    if stagger_seconds < 0 or stagger_seconds > 3600:
+        raise ValueError("stagger_seconds must be between 0 and 3600.")
+
+    updates = []
+    for position, item in enumerate(items):
+        item.reload()
+        item_type = getattr(item, "TYPE", None) or item.__class__.__name__.lower()
+        if item_type not in allowed_types:
+            raise ValueError(
+                f"addedAt editing supports movie, show, season, and episode items only; "
+                f"rating key {getattr(item, 'ratingKey', '?')} is type '{item_type}'."
+            )
+        if not hasattr(item, "editAddedAt"):
+            raise ValueError(
+                f"PlexAPI does not expose addedAt editing for rating key {getattr(item, 'ratingKey', '?')}."
+            )
+
+        previous = getattr(item, "addedAt", None)
+        previous_iso = previous.isoformat() if hasattr(previous, "isoformat") else previous
+        target_timestamp = int(base_timestamp) - (position * stagger_seconds)
+        item.editAddedAt(target_timestamp, locked=bool(locked))
+
+        updates.append({
+            "position": position + 1,
+            "type": item_type,
+            "title": getattr(item, "title", None),
+            "year": getattr(item, "year", None),
+            "show": getattr(item, "grandparentTitle", None),
+            "season": getattr(item, "parentIndex", None),
+            "episode": getattr(item, "index", None) if item_type == "episode" else None,
+            "rating_key": str(getattr(item, "ratingKey", "")) or None,
+            "previous_added_at": previous_iso,
+            "added_at_unix": target_timestamp,
+            "added_at": _added_at_iso(target_timestamp),
+            "added_at_locked": bool(locked),
+        })
+
+    return updates
+
+
+@mcp.tool(
+    description=(
+        "Read the current Plex addedAt timestamp for one exact movie, TV show, season, or episode by rating key. "
+        "This field controls Recently Added ordering. Read-only and does not touch media files."
+    ),
+    annotations=ToolAnnotations(read_only_hint=True, idempotent_hint=True),
+)
+def plex_get_item_added_at(
+    library_name: str,
+    rating_key: str,
+) -> dict:
+    server = _plex()
+    section = _exact_section(server, library_name)
+    items = _load_rating_key_items(server, section, [rating_key])
+    item = items[0]
+    item.reload()
+
+    item_type = getattr(item, "TYPE", None) or item.__class__.__name__.lower()
+    if item_type not in {"movie", "show", "season", "episode"}:
+        raise ValueError("plex_get_item_added_at supports movie, show, season, and episode items only.")
+
+    value = getattr(item, "addedAt", None)
+    return {
+        "library": section.title,
+        "type": item_type,
+        "title": getattr(item, "title", None),
+        "year": getattr(item, "year", None),
+        "show": getattr(item, "grandparentTitle", None),
+        "season": getattr(item, "parentIndex", None),
+        "episode": getattr(item, "index", None) if item_type == "episode" else None,
+        "rating_key": str(getattr(item, "ratingKey", "")) or None,
+        "added_at": value.isoformat() if hasattr(value, "isoformat") else value,
+        "field_locks": _field_lock_states(item),
+    }
+
+
+@mcp.tool(
+    description=(
+        "Set Plex addedAt for exact movie/show/season/episode rating keys without moving, deleting, rematching, or downloading media. "
+        "Omit added_at or use 'now' to place the items at the top of Recently Added. The supplied rating-key order is newest first. "
+        "stagger_seconds defaults to 1 so Plex has an unambiguous order; each subsequent item receives an earlier timestamp. "
+        "added_at may also be a unix timestamp, YYYY-MM-DD, or ISO-8601 date/time. Returns previous timestamps for audit/reversal."
+    ),
+    annotations=ToolAnnotations(read_only_hint=False, destructive_hint=False, idempotent_hint=False),
+)
+def plex_set_items_added_at(
+    library_name: str,
+    rating_keys: list[str],
+    added_at: Optional[str] = None,
+    stagger_seconds: int = 1,
+    locked: bool = True,
+) -> dict:
+    keys = _normalize_rating_keys(rating_keys)
+    if len(keys) > 500:
+        raise ValueError("A single addedAt update is limited to 500 exact items.")
+
+    server = _plex()
+    section = _exact_section(server, library_name)
+    items = _load_rating_key_items(server, section, keys, require_same_type=False)
+    base_timestamp, parsed_as = _parse_added_at_value(added_at)
+    updates = _set_added_at_for_items(items, base_timestamp, stagger_seconds, locked)
+
+    return {
+        "changed": bool(updates),
+        "library": section.title,
+        "target_count": len(updates),
+        "base_added_at_unix": base_timestamp,
+        "base_added_at": _added_at_iso(base_timestamp),
+        "parsed_as": parsed_as,
+        "stagger_seconds": int(stagger_seconds),
+        "newest_first": True,
+        "items": updates,
+        "note": "Only Plex addedAt metadata was changed. Media files and other metadata were not modified.",
+    }
+
+
+@mcp.tool(
+    description=(
+        "Set Plex addedAt in bulk for items selected by PlexAPI library filters, without moving, deleting, rematching, or downloading media. "
+        "Use filters_json with Plex filter syntax, for example {\"actor\":\"Dolly Parton\"}, {\"director\":\"John Carpenter\"}, "
+        "or {\"collection\":\"Alien Collection\"}. libtype may be movie, show, season, or episode. "
+        "Omit added_at or use 'now' to make every matched item Recently Added. Results are sorted deterministically before timestamps are staggered. "
+        "The operation refuses to run if the match count exceeds max_items, preventing silent partial updates."
+    ),
+    annotations=ToolAnnotations(read_only_hint=False, destructive_hint=False, idempotent_hint=False),
+)
+def plex_set_filtered_items_added_at(
+    library_name: str,
+    filters_json: str,
+    libtype: Optional[str] = None,
+    added_at: Optional[str] = None,
+    stagger_seconds: int = 1,
+    sort: Optional[str] = "titleSort",
+    max_items: int = 500,
+    locked: bool = True,
+) -> dict:
+    server = _plex()
+    section = _exact_section(server, library_name)
+    filters = _parse_filters_json(filters_json)
+    if not filters:
+        raise ValueError("filters_json must contain at least one Plex library filter for a bulk addedAt write.")
+
+    max_items = max(1, min(int(max_items), 500))
+    if libtype is not None and str(libtype).casefold() not in {"movie", "show", "season", "episode"}:
+        raise ValueError("libtype must be movie, show, season, episode, or omitted.")
+
+    items = section.search(
+        libtype=libtype,
+        sort=sort,
+        filters=filters,
+        maxresults=max_items + 1,
+    )
+    if len(items) > max_items:
+        raise ValueError(
+            f"The filter matched more than max_items={max_items}. Narrow the filter or explicitly raise max_items up to 500. "
+            "No addedAt values were changed."
+        )
+    if not items:
+        return {
+            "changed": False,
+            "library": section.title,
+            "library_type": getattr(section, "type", None),
+            "filters": filters,
+            "libtype": libtype,
+            "target_count": 0,
+            "items": [],
+            "reason": "no_matches",
+        }
+
+    base_timestamp, parsed_as = _parse_added_at_value(added_at)
+    updates = _set_added_at_for_items(items, base_timestamp, stagger_seconds, locked)
+    return {
+        "changed": bool(updates),
+        "library": section.title,
+        "library_type": getattr(section, "type", None),
+        "filters": filters,
+        "libtype": libtype,
+        "sort": sort,
+        "target_count": len(updates),
+        "base_added_at_unix": base_timestamp,
+        "base_added_at": _added_at_iso(base_timestamp),
+        "parsed_as": parsed_as,
+        "stagger_seconds": int(stagger_seconds),
+        "newest_first": True,
+        "items": updates,
+        "note": "Only Plex addedAt metadata was changed. Media files and other metadata were not modified.",
+    }
+
+
+@mcp.tool(
+    description=(
+        "Refresh/warm Plex's transient hubs for one exact library, including rows such as Recently Added, then verify the library's "
+        "current Recently Added ordering directly from addedAt. This is a non-destructive cache nudge only: it does not scan the library, "
+        "refresh item metadata, restart Plex, delete cache files, move media, or change any metadata. It may reduce stale Home hub behavior, "
+        "but individual Plex clients can still retain their own local cached Home rows."
+    ),
+    annotations=ToolAnnotations(read_only_hint=True, idempotent_hint=True),
+)
+def plex_refresh_library_hubs(
+    library_name: str,
+    hub_item_count: int = 20,
+    verify_recent_count: int = 25,
+) -> dict:
+    server = _plex()
+    section = _exact_section(server, library_name)
+
+    hub_item_count = max(1, min(int(hub_item_count), 100))
+    verify_recent_count = max(1, min(int(verify_recent_count), 100))
+
+    # Plex documents onlyTransient=1 for hubs prone to changing after media
+    # playback or addition (for example On Deck and Recently Added). Fetching
+    # the section-scoped transient hubs is intentionally only a refresh/warm
+    # request; it does not mutate library metadata or invoke a library scan.
+    hub_key = f"/hubs/sections/{section.key}?{urlencode({'onlyTransient': 1, 'count': hub_item_count})}"
+    hub_root = server.query(hub_key)
+
+    hubs = []
+    try:
+        for hub in list(hub_root):
+            attrib = getattr(hub, "attrib", {}) or {}
+            hubs.append({
+                "title": attrib.get("title"),
+                "identifier": attrib.get("hubIdentifier") or attrib.get("identifier"),
+                "type": attrib.get("type"),
+                "size": _safe_int(attrib.get("size"), 0),
+            })
+    except Exception:
+        # A successful query is the refresh action. Hub parsing is best-effort
+        # because Plex response shape can vary by server/library type.
+        hubs = []
+
+    libtype = getattr(section, "type", None)
+    recent_items = section.recentlyAdded(
+        maxresults=verify_recent_count,
+        libtype=libtype,
+    )
+    recent_rows = []
+    for position, item in enumerate(recent_items, start=1):
+        value = getattr(item, "addedAt", None)
+        recent_rows.append({
+            "position": position,
+            "type": getattr(item, "TYPE", None) or item.__class__.__name__.lower(),
+            "title": getattr(item, "title", None),
+            "year": getattr(item, "year", None),
+            "rating_key": str(getattr(item, "ratingKey", "")) or None,
+            "added_at": value.isoformat() if hasattr(value, "isoformat") else value,
+        })
+
+    return {
+        "refreshed": True,
+        "library": section.title,
+        "library_key": str(section.key),
+        "library_type": libtype,
+        "method": "GET section transient hubs (onlyTransient=1) followed by direct Recently Added verification",
+        "transient_hubs_returned": len(hubs),
+        "transient_hubs": hubs,
+        "recently_added_verified_count": len(recent_rows),
+        "recently_added_top": recent_rows,
+        "note": (
+            "No Plex media, metadata, filesystem cache, library scan, or server process was modified. "
+            "This warms/refreshes the server-side transient hub response and verifies current addedAt ordering; "
+            "a Plex client may still need to refresh its own cached Home screen."
+        ),
+    }
+
+
 @mcp.tool(
     description=(
         "Upload or replace the poster for one exact Plex movie or TV show by rating key. Provide exactly one source: "
-        "an http/https image_url, or a local_filepath on the gateway server. Local files are limited to jpg/jpeg/png/webp. "
+        "an http/https image_url, or a local_filepath on the Plex server. Local files are limited to jpg/jpeg/png/webp. "
         "Only the selected item's poster is changed; title, summary, collections, labels, ratings, files, and all other metadata are preserved. "
         "The selected poster is locked so a normal metadata refresh does not replace the manual artwork."
     ),
@@ -1628,7 +2399,7 @@ def plex_set_item_poster(
 @mcp.tool(
     description=(
         "Upload or replace the poster for one exact Plex collection. Provide exactly one source: an http/https "
-        "image_url, or a local_filepath on the gateway server. Local files are limited to jpg/jpeg/png/webp. "
+        "image_url, or a local_filepath on the Plex server. Local files are limited to jpg/jpeg/png/webp. "
         "This changes collection artwork only and never changes collection membership or underlying media."
     ),
     annotations=ToolAnnotations(read_only_hint=False, destructive_hint=False, idempotent_hint=False),
@@ -1664,7 +2435,7 @@ def plex_set_collection_poster(
 @mcp.tool(
     description=(
         "Upload or replace the background artwork for one exact Plex collection. Provide exactly one source: "
-        "an http/https image_url, or a local_filepath on the gateway server. Local files are limited to "
+        "an http/https image_url, or a local_filepath on the Plex server. Local files are limited to "
         "jpg/jpeg/png/webp. This changes collection artwork only and never changes collection membership or media."
     ),
     annotations=ToolAnnotations(read_only_hint=False, destructive_hint=False, idempotent_hint=False),
@@ -2491,7 +3262,7 @@ def _tautulli_endpoint(cmd: str, params: Optional[dict] = None) -> str:
 
 def _tautulli_api(cmd: str, params: Optional[dict] = None, timeout: int = 60):
     url = _tautulli_endpoint(cmd, params)
-    request = Request(url, headers={"User-Agent": "MediaStack-Control-Gateway/3.4.3"})
+    request = Request(url, headers={"User-Agent": "MediaStack-Control-Gateway/3.4.6"})
     try:
         with urlopen(request, timeout=timeout) as response:
             raw = response.read()
@@ -3105,7 +3876,7 @@ def plex_reporting_export_status(library_name: str, export_id: int) -> dict:
 def _download_export_to_local_cache(export_id: int) -> dict:
     export_id = int(export_id)
     url = _tautulli_endpoint("download_export", {"export_id": export_id})
-    request = Request(url, headers={"User-Agent": "MediaStack-Control-Gateway/3.4.3"})
+    request = Request(url, headers={"User-Agent": "MediaStack-Control-Gateway/3.4.6"})
     try:
         with urlopen(request, timeout=300) as response:
             raw = response.read()
@@ -3360,7 +4131,7 @@ def _arr_api(
     headers = {
         "X-Api-Key": cfg["api_key"],
         "Accept": "application/json",
-        "User-Agent": "MediaStack-Control-Gateway-Arr/3.4.3",
+        "User-Agent": "MediaStack-Control-Gateway-Arr/3.4.5",
     }
     if body is not None:
         data = json.dumps(body).encode("utf-8")
@@ -4527,6 +5298,8 @@ $pythonServer = $pythonServer.Replace('__RADARR_API_KEY__', $RadarrApiKey.Replac
 $pythonServer = $pythonServer.Replace('__LIDARR_URL__', $LidarrUrl.Replace('\', '\\').Replace('"', '\"'))
 $pythonServer = $pythonServer.Replace('__LIDARR_API_KEY__', $LidarrApiKey.Replace('\', '\\').Replace('"', '\"'))
 $pythonServer = $pythonServer.Replace('__REPORT_EXPORT_DIR__', $ReportingExportDir.Replace('\', '\\').Replace('"', '\"'))
+$pythonServer = $pythonServer.Replace('__TUNNEL_RUNTIME_LOG__', (Join-Path $LogDir 'tunnel-runtime.log').Replace('\', '\\').Replace('"', '\"'))
+$pythonServer = $pythonServer.Replace('__TUNNEL_HEALTH_URL_FILE__', $HealthUrlFile.Replace('\', '\\').Replace('"', '\"'))
 
 $McpServerChanged = Set-ContentIfChanged -Path $McpServer -Content $pythonServer
 Set-SecureAcl -Path $McpServer
@@ -4599,21 +5372,53 @@ $arrResult = Invoke-NativeCaptured `
 if ($arrResult.ExitCode -eq 0 -and -not [string]::IsNullOrWhiteSpace($arrResult.StdOut)) {
     try {
         $arrStatuses = $arrResult.StdOut.Trim() | ConvertFrom-Json
+
+        # Current arr_status() returns application states under an "applications"
+        # object. Retain compatibility with older gateway responses that returned
+        # sonarr/radarr/lidarr directly at the root.
+        if ($arrStatuses.PSObject.Properties.Name -contains 'applications' -and $null -ne $arrStatuses.applications) {
+            $arrApplications = $arrStatuses.applications
+        }
+        else {
+            $arrApplications = $arrStatuses
+        }
+
         foreach ($arrName in @('sonarr', 'radarr', 'lidarr')) {
             $displayName = (Get-Culture).TextInfo.ToTitleCase($arrName)
-            $status = $arrStatuses.$arrName
+            $status = $arrApplications.$arrName
+
+            if ($null -eq $status) {
+                $arrAvailability[$arrName] = $false
+                Write-Warning "$displayName status was missing from the Arr validation response."
+                continue
+            }
+
             $available = [bool]$status.available
             $arrAvailability[$arrName] = $available
+
             if ($available) {
-                Write-Skip "$displayName API works. Version: $($status.version); Items: $($status.item_count)"
+                $details = @()
+                if ($status.PSObject.Properties.Name -contains 'version' -and $status.version) {
+                    $details += "Version: $($status.version)"
+                }
+                if ($status.PSObject.Properties.Name -contains 'api_version' -and $status.api_version) {
+                    $details += "API: $($status.api_version)"
+                }
+                if ($status.PSObject.Properties.Name -contains 'health_issue_count' -and $null -ne $status.health_issue_count) {
+                    $details += "Health issues: $($status.health_issue_count)"
+                }
+
+                $detailText = if ($details.Count -gt 0) { ' ' + ($details -join '; ') } else { '' }
+                Write-Good "$displayName API works.$detailText"
             }
             else {
-                Write-Warning "$displayName API unavailable: $($status.error)"
+                $errorText = if ($status.PSObject.Properties.Name -contains 'error' -and $status.error) { $status.error } else { 'No error detail returned.' }
+                Write-Warning "$displayName API unavailable: $errorText"
             }
         }
     }
     catch {
-        Write-Warning "Arr validation returned data that could not be parsed: $($arrResult.StdOut.Trim())"
+        Write-Warning "Arr validation response processing failed: $($_.Exception.Message)"
     }
 }
 else {
@@ -4723,20 +5528,33 @@ else {
 $doctorLog = Join-Path $LogDir 'doctor.txt'
 
 $existingTaskAtStage8 = Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue
-$runtimeAlreadyReady = ($existingTaskAtStage8 -and $existingTaskAtStage8.State -eq 'Running' -and (Test-TunnelReady))
+$runtimeAlreadyHealthy = ($existingTaskAtStage8 -and $existingTaskAtStage8.State -eq 'Running' -and (Test-TunnelHealth))
+$runtimeAlreadyReady = ($runtimeAlreadyHealthy -and (Test-TunnelReady))
 
-if ((-not $profileChanged) -and (-not $McpServerChanged) -and $runtimeAlreadyReady) {
-    Write-Skip 'Existing tunnel runtime is ready, the profile is unchanged, and MCP code is unchanged. Skipping doctor.'
+if ((-not $profileChanged) -and (-not $McpServerChanged) -and $runtimeAlreadyHealthy) {
+    if ($runtimeAlreadyReady) {
+        Write-Skip 'Existing tunnel runtime is healthy and ready; profile and MCP code are unchanged. Skipping doctor.'
+    }
+    else {
+        Write-Warning 'Existing tunnel runtime is live (/healthz is healthy) but /readyz is not currently ready. Leaving the live tunnel intact and skipping doctor.'
+    }
 }
 else {
     if ($existingTaskAtStage8 -and $existingTaskAtStage8.State -eq 'Running') {
         if ($McpServerChanged) {
             Write-Fix 'Stopping existing tunnel because MCP tool definitions changed.'
         }
+        elseif ($profileChanged) {
+            Write-Fix 'Stopping existing tunnel because the tunnel profile changed.'
+        }
+        else {
+            Write-Fix 'Stopping existing tunnel because liveness validation failed.'
+        }
         Stop-TunnelTaskIfRunning
     }
 
     Remove-Item -LiteralPath $HealthUrlFile -Force -Confirm:$false -ErrorAction SilentlyContinue
+    Remove-Item -LiteralPath $LegacyHealthUrlFile -Force -Confirm:$false -ErrorAction SilentlyContinue
 
     Write-Host 'Validating profile with tunnel-client doctor...'
     & $TunnelExe doctor --profile $ProfileName --explain *> $doctorLog
@@ -4748,8 +5566,8 @@ else {
 
     Write-Skip 'Directly generated tunnel profile passes tunnel-client doctor.'
 
-    # doctor is short-lived and may publish its temporary health URL. Delete it
-    # so the persistent runtime must publish a fresh URL in Stage 11.
+    # doctor is short-lived and may publish its temporary health endpoint. Delete it
+    # so the persistent runtime must publish a fresh endpoint in Stage 11.
     Remove-Item -LiteralPath $HealthUrlFile -Force -Confirm:$false -ErrorAction SilentlyContinue
 }
 
@@ -4763,34 +5581,121 @@ $runnerContent = @"
 `$env:CONTROL_PLANE_API_KEY = '$OpenAiRuntimeKey'
 `$env:TUNNEL_CLIENT_PROFILE_DIR = '$ProfileDir'
 
-`$log = '$LogDir\tunnel-runtime.log'
+`$runtimeLog = '$LogDir\tunnel-runtime.log'
+`$runtimeLogMaxBytes = [int64]$RuntimeLogMaxBytes
+`$runtimeLogRetain = $RuntimeLogRetainedFiles
 `$restartDelaySeconds = 10
+`$utf8NoBom = New-Object System.Text.UTF8Encoding(`$false)
+`$script:RuntimeLogBytes = 0L
 
-function Write-RunnerLog {
-    param([string]`$Message)
-    "[`$([DateTime]::Now.ToString('s'))] `$Message" | Out-File -FilePath `$log -Append -Encoding utf8
+function Rotate-RuntimeLog {
+    param([switch]`$Force)
+
+    try {
+        if (-not (Test-Path -LiteralPath `$runtimeLog)) {
+            `$script:RuntimeLogBytes = 0L
+            return
+        }
+
+        `$item = Get-Item -LiteralPath `$runtimeLog -ErrorAction Stop
+        if ((-not `$Force) -and `$item.Length -lt `$runtimeLogMaxBytes) {
+            `$script:RuntimeLogBytes = [int64]`$item.Length
+            return
+        }
+
+        # If an old pre-rotation log is enormous, preserve only its newest
+        # RuntimeLogMaxBytes as .1 rather than retaining gigabytes of stale data.
+        if (`$item.Length -gt (`$runtimeLogMaxBytes * (`$runtimeLogRetain + 1))) {
+            for (`$i = `$runtimeLogRetain; `$i -ge 2; `$i--) {
+                `$source = "`$runtimeLog.`$(`$i - 1)"
+                `$dest = "`$runtimeLog.`$i"
+                if (Test-Path -LiteralPath `$dest) { Remove-Item -LiteralPath `$dest -Force -Confirm:`$false -ErrorAction SilentlyContinue }
+                if (Test-Path -LiteralPath `$source) { Move-Item -LiteralPath `$source -Destination `$dest -Force -Confirm:`$false }
+            }
+
+            `$tailTemp = "`$runtimeLog.trim.tmp"
+            if (Test-Path -LiteralPath `$tailTemp) { Remove-Item -LiteralPath `$tailTemp -Force -Confirm:`$false -ErrorAction SilentlyContinue }
+            `$input = [System.IO.File]::Open(`$runtimeLog, [System.IO.FileMode]::Open, [System.IO.FileAccess]::Read, [System.IO.FileShare]::ReadWrite)
+            try {
+                `$tailBytes = [Math]::Min([int64]`$runtimeLogMaxBytes, [int64]`$input.Length)
+                [void]`$input.Seek(-`$tailBytes, [System.IO.SeekOrigin]::End)
+                `$output = [System.IO.File]::Open(`$tailTemp, [System.IO.FileMode]::Create, [System.IO.FileAccess]::Write, [System.IO.FileShare]::None)
+                try { `$input.CopyTo(`$output) } finally { `$output.Dispose() }
+            }
+            finally { `$input.Dispose() }
+
+            `$firstArchive = "`$runtimeLog.1"
+            if (Test-Path -LiteralPath `$firstArchive) { Remove-Item -LiteralPath `$firstArchive -Force -Confirm:`$false -ErrorAction SilentlyContinue }
+            Move-Item -LiteralPath `$tailTemp -Destination `$firstArchive -Force -Confirm:`$false
+            Remove-Item -LiteralPath `$runtimeLog -Force -Confirm:`$false -ErrorAction SilentlyContinue
+        }
+        else {
+            for (`$i = `$runtimeLogRetain; `$i -ge 1; `$i--) {
+                `$source = if (`$i -eq 1) { `$runtimeLog } else { "`$runtimeLog.`$(`$i - 1)" }
+                `$dest = "`$runtimeLog.`$i"
+                if (Test-Path -LiteralPath `$dest) { Remove-Item -LiteralPath `$dest -Force -Confirm:`$false -ErrorAction SilentlyContinue }
+                if (Test-Path -LiteralPath `$source) { Move-Item -LiteralPath `$source -Destination `$dest -Force -Confirm:`$false }
+            }
+        }
+    }
+    catch {
+        # Logging maintenance must never take the tunnel offline.
+    }
+
+    `$script:RuntimeLogBytes = 0L
 }
 
-Write-RunnerLog 'Tunnel supervisor started.'
+function Write-RuntimeLogLine {
+    param(
+        [AllowEmptyString()][string]`$Text,
+        [switch]`$Supervisor
+    )
+
+    `$entry = if (`$Supervisor) { "[`$([DateTime]::Now.ToString('s'))] SUPERVISOR `$Text" } else { [string]`$Text }
+    `$payload = `$entry + [Environment]::NewLine
+    `$bytes = [int64]`$utf8NoBom.GetByteCount(`$payload)
+
+    if ((`$script:RuntimeLogBytes + `$bytes) -gt `$runtimeLogMaxBytes) {
+        Rotate-RuntimeLog -Force
+    }
+
+    try {
+        [System.IO.File]::AppendAllText(`$runtimeLog, `$payload, `$utf8NoBom)
+        `$script:RuntimeLogBytes += `$bytes
+    }
+    catch {
+        # Never terminate the supervisor because a diagnostic log write failed.
+    }
+}
+
+# Initialize size accounting and collapse any legacy runaway log before the
+# first tunnel-client launch under the new supervisor.
+Rotate-RuntimeLog
+Write-RuntimeLogLine -Supervisor -Text 'Tunnel supervisor started.'
 
 while (`$true) {
     try {
-        Write-RunnerLog 'Starting tunnel-client.'
+        Write-RuntimeLogLine -Supervisor -Text 'Starting tunnel-client.'
 
-        & '$TunnelExe' run --profile '$ProfileName' *>> `$log
+        # Stream both native stdout and stderr through PowerShell so the runner
+        # can rotate the file while the tunnel remains alive. This also keeps
+        # the managed runtime log consistently UTF-8 instead of mixed encodings.
+        & '$TunnelExe' run --profile '$ProfileName' 2>&1 | ForEach-Object {
+            Write-RuntimeLogLine -Text ([string]`$_)
+        }
         `$exitCode = `$LASTEXITCODE
 
-        Write-RunnerLog "tunnel-client exited with code `$exitCode. Restarting in `$restartDelaySeconds seconds."
+        Write-RuntimeLogLine -Supervisor -Text "tunnel-client exited with code `$exitCode. Restarting in `$restartDelaySeconds seconds."
     }
     catch {
-        Write-RunnerLog "Tunnel supervisor caught exception: `$(`$_.Exception.Message). Restarting in `$restartDelaySeconds seconds."
+        Write-RuntimeLogLine -Supervisor -Text "Tunnel supervisor caught exception: `$(`$_.Exception.Message). Restarting in `$restartDelaySeconds seconds."
     }
 
     Start-Sleep -Seconds `$restartDelaySeconds
 }
 "@
 
-[void](Set-ContentIfChanged -Path $TunnelRunner -Content $runnerContent)
+$TunnelRunnerChanged = Set-ContentIfChanged -Path $TunnelRunner -Content $runnerContent
 Set-SecureAcl -Path $TunnelRunner
 
 $watchdogContent = @"
@@ -4799,71 +5704,269 @@ $watchdogContent = @"
 `$taskName = '$TaskName'
 `$healthUrlFile = '$HealthUrlFile'
 `$watchdogLog = '$LogDir\tunnel-watchdog.log'
+`$stateFile = '$WatchdogStateFile'
+`$logMaxBytes = [int64]$WatchdogLogMaxBytes
+`$logRetain = $WatchdogLogRetainedFiles
+`$readinessFailureThreshold = $WatchdogReadinessFailureThreshold
+`$readinessRestartCooldownMinutes = $WatchdogReadinessRestartCooldownMinutes
+`$startupGraceSeconds = $WatchdogStartupGraceSeconds
+`$healthyHeartbeatMinutes = $WatchdogHealthyHeartbeatMinutes
+`$utf8NoBom = New-Object System.Text.UTF8Encoding(`$false)
+
+function Rotate-WatchdogLogIfNeeded {
+    try {
+        if (-not (Test-Path -LiteralPath `$watchdogLog)) { return }
+        `$item = Get-Item -LiteralPath `$watchdogLog -ErrorAction Stop
+        if (`$item.Length -lt `$logMaxBytes) { return }
+        for (`$i = `$logRetain; `$i -ge 1; `$i--) {
+            `$source = if (`$i -eq 1) { `$watchdogLog } else { "`$watchdogLog.`$(`$i - 1)" }
+            `$dest = "`$watchdogLog.`$i"
+            if (Test-Path -LiteralPath `$dest) { Remove-Item -LiteralPath `$dest -Force -Confirm:`$false -ErrorAction SilentlyContinue }
+            if (Test-Path -LiteralPath `$source) { Move-Item -LiteralPath `$source -Destination `$dest -Force -Confirm:`$false }
+        }
+    }
+    catch { }
+}
 
 function Write-WatchdogLog {
     param([string]`$Message)
-    "[`$([DateTime]::Now.ToString('s'))] `$Message" | Out-File -FilePath `$watchdogLog -Append -Encoding utf8
+    Rotate-WatchdogLogIfNeeded
+    try {
+        `$line = "[`$([DateTime]::Now.ToString('s'))] `$Message" + [Environment]::NewLine
+        [System.IO.File]::AppendAllText(`$watchdogLog, `$line, `$utf8NoBom)
+    }
+    catch { }
 }
 
-function Test-TunnelReadyLocal {
-    if (-not (Test-Path -LiteralPath `$healthUrlFile)) {
-        return `$false
+function Get-DefaultState {
+    return @{
+        readiness_failures = 0
+        last_readiness_restart_utc = `$null
+        last_healthy_log_utc = `$null
+        last_status = 'unknown'
     }
+}
 
+function Get-WatchdogState {
+    `$state = Get-DefaultState
+    if (-not (Test-Path -LiteralPath `$stateFile)) { return `$state }
+    try {
+        `$loaded = Get-Content -LiteralPath `$stateFile -Raw -ErrorAction Stop | ConvertFrom-Json -ErrorAction Stop
+        foreach (`$name in @('readiness_failures','last_readiness_restart_utc','last_healthy_log_utc','last_status')) {
+            if (`$loaded.PSObject.Properties.Name -contains `$name) { `$state[`$name] = `$loaded.`$name }
+        }
+    }
+    catch { }
+    return `$state
+}
+
+function Save-WatchdogState {
+    param([hashtable]`$State)
+    try {
+        `$json = `$State | ConvertTo-Json -Depth 3
+        [System.IO.File]::WriteAllText(`$stateFile, `$json, `$utf8NoBom)
+    }
+    catch { }
+}
+
+function Parse-UtcDate {
+    param([object]`$Value)
+    if (`$null -eq `$Value -or [string]::IsNullOrWhiteSpace([string]`$Value)) { return `$null }
+    try { return [DateTime]::Parse([string]`$Value).ToUniversalTime() } catch { return `$null }
+}
+
+function Get-HealthBaseUrl {
+    if (-not (Test-Path -LiteralPath `$healthUrlFile)) { return `$null }
     try {
         `$baseUrl = (Get-Content -LiteralPath `$healthUrlFile -Raw -ErrorAction Stop).Trim().TrimEnd('/')
-        if (`$baseUrl -notmatch '^http://127\.0\.0\.1:\d+`$') {
-            return `$false
-        }
+        if (`$baseUrl -match '^http://127\.0\.0\.1:\d+`$') { return `$baseUrl }
+    }
+    catch { }
+    return `$null
+}
 
-        `$response = Invoke-WebRequest `
-            -UseBasicParsing `
-            -Uri (`$baseUrl + '/readyz') `
-            -TimeoutSec 5 `
-            -ErrorAction Stop
+function Invoke-LocalProbe {
+    param(
+        [Parameter(Mandatory=`$true)][string]`$BaseUrl,
+        [Parameter(Mandatory=`$true)][string]`$Path
+    )
 
-        return (`$response.StatusCode -eq 200)
+    try {
+        `$response = Invoke-WebRequest -UseBasicParsing -Uri (`$BaseUrl + `$Path) -TimeoutSec 5 -ErrorAction Stop
+        return [pscustomobject]@{ Ok = (`$response.StatusCode -eq 200); StatusCode = [int]`$response.StatusCode; Body = [string]`$response.Content; Error = `$null }
     }
     catch {
-        return `$false
+        `$statusCode = `$null
+        `$body = ''
+        if (`$null -ne `$_.Exception.Response) {
+            try { `$statusCode = [int]`$_.Exception.Response.StatusCode } catch { }
+            try {
+                `$stream = `$_.Exception.Response.GetResponseStream()
+                if (`$null -ne `$stream) {
+                    `$reader = New-Object System.IO.StreamReader(`$stream)
+                    try { `$body = `$reader.ReadToEnd() } finally { `$reader.Dispose() }
+                }
+            }
+            catch { }
+        }
+        return [pscustomobject]@{ Ok = `$false; StatusCode = `$statusCode; Body = `$body; Error = `$_.Exception.Message }
     }
+}
+
+function Format-ProbeDetail {
+    param([object]`$Probe)
+    `$parts = @()
+    if (`$null -ne `$Probe.StatusCode) { `$parts += "HTTP `$(`$Probe.StatusCode)" }
+    if (-not [string]::IsNullOrWhiteSpace([string]`$Probe.Error)) { `$parts += [string]`$Probe.Error }
+    if (-not [string]::IsNullOrWhiteSpace([string]`$Probe.Body)) {
+        `$body = ([string]`$Probe.Body -replace '[\r\n]+',' ').Trim()
+        if (`$body.Length -gt 500) { `$body = `$body.Substring(0,500) }
+        `$parts += "body=`$body"
+    }
+    if (`$parts.Count -eq 0) { return 'no response detail' }
+    return (`$parts -join '; ')
+}
+
+function Restart-PrimaryTunnel {
+    param([Parameter(Mandatory=`$true)][string]`$Reason)
+    Write-WatchdogLog "RESTART: `$Reason"
+    Stop-ScheduledTask -TaskName `$taskName -ErrorAction SilentlyContinue
+    Start-Sleep -Seconds 3
+    Remove-Item -LiteralPath `$healthUrlFile -Force -Confirm:`$false -ErrorAction SilentlyContinue
+    Start-ScheduledTask -TaskName `$taskName
 }
 
 try {
+    `$state = Get-WatchdogState
     `$task = Get-ScheduledTask -TaskName `$taskName -ErrorAction SilentlyContinue
 
     if (-not `$task) {
-        Write-WatchdogLog 'Primary tunnel task does not exist.'
+        Write-WatchdogLog 'ERROR: Primary tunnel task does not exist.'
         exit 2
     }
 
     if (`$task.State -ne 'Running') {
-        Write-WatchdogLog "Primary tunnel task state is '`$(`$task.State)'. Starting it."
+        Write-WatchdogLog "REPAIR: Primary tunnel task state is '`$(`$task.State)'. Starting it."
+        `$state['readiness_failures'] = 0
+        `$state['last_status'] = 'starting'
+        Save-WatchdogState -State `$state
         Remove-Item -LiteralPath `$healthUrlFile -Force -Confirm:`$false -ErrorAction SilentlyContinue
         Start-ScheduledTask -TaskName `$taskName
         exit 0
     }
 
-    if (-not (Test-TunnelReadyLocal)) {
-        Write-WatchdogLog 'Primary task is running but /readyz is unhealthy. Restarting the tunnel task.'
-        Stop-ScheduledTask -TaskName `$taskName -ErrorAction SilentlyContinue
-        Start-Sleep -Seconds 3
-        Remove-Item -LiteralPath `$healthUrlFile -Force -Confirm:`$false -ErrorAction SilentlyContinue
-        Start-ScheduledTask -TaskName `$taskName
+    `$taskInfo = Get-ScheduledTaskInfo -TaskName `$taskName -ErrorAction SilentlyContinue
+    `$taskAgeSeconds = [double]::PositiveInfinity
+    if (`$null -ne `$taskInfo -and `$taskInfo.LastRunTime.Year -ge 2000) {
+        `$taskAgeSeconds = [Math]::Max(0, ((Get-Date) - `$taskInfo.LastRunTime).TotalSeconds)
+    }
+
+    `$baseUrl = Get-HealthBaseUrl
+    if (-not `$baseUrl) {
+        if (`$taskAgeSeconds -lt `$startupGraceSeconds) {
+            `$state['last_status'] = 'startup-grace-no-endpoint'
+            Save-WatchdogState -State `$state
+            Write-WatchdogLog "INFO: Tunnel is within startup grace (`$([int]`$taskAgeSeconds)s/`$startupGraceSeconds s); health endpoint file is not available yet."
+            exit 0
+        }
+        Restart-PrimaryTunnel -Reason 'health endpoint file is missing/invalid after startup grace.'
+        `$state['readiness_failures'] = 0
+        `$state['last_status'] = 'restarting-health'
+        Save-WatchdogState -State `$state
         exit 0
     }
 
-    Write-WatchdogLog 'Tunnel is healthy.'
+    `$health = Invoke-LocalProbe -BaseUrl `$baseUrl -Path '/healthz'
+    if (-not `$health.Ok) {
+        if (`$taskAgeSeconds -lt `$startupGraceSeconds) {
+            `$state['last_status'] = 'startup-grace-health'
+            Save-WatchdogState -State `$state
+            Write-WatchdogLog "INFO: Tunnel /healthz is not ready during startup grace: `$(Format-ProbeDetail `$health)"
+            exit 0
+        }
+        Restart-PrimaryTunnel -Reason "local /healthz liveness failed: `$(Format-ProbeDetail `$health)"
+        `$state['readiness_failures'] = 0
+        `$state['last_status'] = 'restarting-health'
+        Save-WatchdogState -State `$state
+        exit 0
+    }
+
+    `$ready = Invoke-LocalProbe -BaseUrl `$baseUrl -Path '/readyz'
+    if (-not `$ready.Ok) {
+        `$failures = 1 + [int]`$state['readiness_failures']
+        `$state['readiness_failures'] = `$failures
+        `$state['last_status'] = 'not-ready'
+        `$detail = Format-ProbeDetail `$ready
+        Write-WatchdogLog "WARN: /healthz is healthy but /readyz is not ready (`$failures/`$readinessFailureThreshold): `$detail"
+
+        if (`$failures -ge `$readinessFailureThreshold) {
+            `$lastRestart = Parse-UtcDate `$state['last_readiness_restart_utc']
+            `$cooldownActive = `$false
+            if (`$null -ne `$lastRestart) {
+                `$cooldownActive = ((([DateTime]::UtcNow - `$lastRestart).TotalMinutes) -lt `$readinessRestartCooldownMinutes)
+            }
+
+            if (`$cooldownActive) {
+                Write-WatchdogLog "WARN: Readiness restart suppressed by `$readinessRestartCooldownMinutes-minute cooldown; tunnel remains live because /healthz is healthy."
+            }
+            else {
+                `$state['last_readiness_restart_utc'] = [DateTime]::UtcNow.ToString('o')
+                `$state['readiness_failures'] = 0
+                `$state['last_status'] = 'restarting-readiness'
+                Save-WatchdogState -State `$state
+                Restart-PrimaryTunnel -Reason "readiness failed `$failures consecutive checks while liveness remained healthy: `$detail"
+                exit 0
+            }
+        }
+
+        Save-WatchdogState -State `$state
+        exit 0
+    }
+
+    `$previousFailures = [int]`$state['readiness_failures']
+    `$previousStatus = [string]`$state['last_status']
+    `$state['readiness_failures'] = 0
+    `$state['last_status'] = 'healthy'
+
+    if (`$previousFailures -gt 0 -or `$previousStatus -ne 'healthy') {
+        Write-WatchdogLog 'OK: Tunnel recovered; /healthz and /readyz both return HTTP 200.'
+        `$state['last_healthy_log_utc'] = [DateTime]::UtcNow.ToString('o')
+    }
+    else {
+        `$lastHealthyLog = Parse-UtcDate `$state['last_healthy_log_utc']
+        if (`$null -eq `$lastHealthyLog -or (([DateTime]::UtcNow - `$lastHealthyLog).TotalMinutes -ge `$healthyHeartbeatMinutes)) {
+            Write-WatchdogLog 'OK: Tunnel is healthy and ready.'
+            `$state['last_healthy_log_utc'] = [DateTime]::UtcNow.ToString('o')
+        }
+    }
+
+    Save-WatchdogState -State `$state
     exit 0
 }
 catch {
-    Write-WatchdogLog "Watchdog exception: `$(`$_.Exception.Message)"
+    Write-WatchdogLog "ERROR: Watchdog exception: `$(`$_.Exception.Message)"
     exit 1
 }
 "@
 
-[void](Set-ContentIfChanged -Path $WatchdogScript -Content $watchdogContent)
+$WatchdogScriptChanged = Set-ContentIfChanged -Path $WatchdogScript -Content $watchdogContent
 Set-SecureAcl -Path $WatchdogScript
+
+$openUiContent = @"
+`$ErrorActionPreference = 'Stop'
+`$endpointFile = '$HealthUrlFile'
+if (-not (Test-Path -LiteralPath `$endpointFile)) {
+    throw "Tunnel health endpoint file does not exist yet: `$endpointFile"
+}
+`$baseUrl = (Get-Content -LiteralPath `$endpointFile -Raw).Trim().TrimEnd('/')
+if (`$baseUrl -notmatch '^http://127\.0\.0\.1:\d+`$') {
+    throw "Tunnel health endpoint file does not contain a valid localhost URL: `$baseUrl"
+}
+Start-Process (`$baseUrl + '/ui')
+"@
+
+$OpenTunnelUiChanged = Set-ContentIfChanged -Path $OpenTunnelUiScript -Content $openUiContent
+Set-SecureAcl -Path $OpenTunnelUiScript
 
 # ===========================================================================
 # 10. Create/reuse scheduled tasks
@@ -4908,10 +6011,10 @@ if ($taskNeedsUpdate) {
         -Trigger $trigger `
         -Settings $settings `
         -Principal $principal `
-        -Description 'Self-healing OpenAI secure tunnel for the local MediaStack Control Gateway server.' `
+        -Description 'Self-healing OpenAI secure tunnel for the local MediaStack Control Gateway MCP server.' `
         -Force | Out-Null
 
-    Write-Host 'Primary tunnel scheduled task created/updated.'
+    Write-Good 'Primary tunnel scheduled task created/updated.'
 }
 
 # Watchdog runs every minute and repairs the primary task if it is stopped or unhealthy.
@@ -4954,10 +6057,10 @@ if ($watchdogNeedsUpdate) {
         -Trigger $watchdogTrigger `
         -Settings $watchdogSettings `
         -Principal $watchdogPrincipal `
-        -Description 'Checks the MediaStack Control Gateway tunnel every minute and restarts it if unhealthy.' `
+        -Description 'Checks MediaStack Control Gateway tunnel health every minute and performs bounded recovery when necessary.' `
         -Force | Out-Null
 
-    Write-Host 'Tunnel watchdog scheduled task created/updated.'
+    Write-Good 'Tunnel watchdog scheduled task created/updated.'
 }
 
 # ===========================================================================
@@ -4966,17 +6069,33 @@ if ($watchdogNeedsUpdate) {
 Show-Stage 11 'Start or reuse tunnel runtime'
 
 $task = Get-ScheduledTask -TaskName $TaskName
+$runtimeHealthyNow = ($task.State -eq 'Running' -and (Test-TunnelHealth))
+$runtimeNeedsReload = ($McpServerChanged -or $profileChanged -or $TunnelRunnerChanged)
 
-if ($task.State -eq 'Running' -and (Test-TunnelReady) -and (-not $McpServerChanged)) {
-    Write-Skip 'Tunnel scheduled task is already running, /readyz reports ready, and MCP code is unchanged.'
+if ($runtimeHealthyNow -and (-not $runtimeNeedsReload)) {
+    Write-Skip 'Tunnel scheduled task is running and /healthz reports healthy; runtime code/profile are unchanged.'
+    if (-not (Test-TunnelReady)) {
+        $readyDetail = Get-TunnelLocalProbe -Path '/readyz' -TimeoutSeconds 3
+        $detailText = @()
+        if ($null -ne $readyDetail.StatusCode) { $detailText += "HTTP $($readyDetail.StatusCode)" }
+        if (-not [string]::IsNullOrWhiteSpace($readyDetail.Error)) { $detailText += $readyDetail.Error }
+        if (-not [string]::IsNullOrWhiteSpace($readyDetail.Body)) { $detailText += (($readyDetail.Body -replace '[\r\n]+',' ').Trim()) }
+        Write-Warning ("Tunnel is live but /readyz is not currently ready. It will not be restarted immediately. " + ($detailText -join '; '))
+    }
 }
 else {
     if ($task.State -eq 'Running') {
         if ($McpServerChanged) {
             Write-Fix 'Tunnel task is healthy but MCP code changed. Restarting to load the new tool schema.'
         }
+        elseif ($profileChanged) {
+            Write-Fix 'Tunnel profile changed. Restarting the runtime to publish the new health endpoint file and settings.'
+        }
+        elseif ($TunnelRunnerChanged) {
+            Write-Fix 'Tunnel supervisor changed. Restarting the runtime to load the new supervisor/log-rotation behavior.'
+        }
         else {
-            Write-Fix 'Tunnel task is running but is not ready. Restarting it.'
+            Write-Fix 'Tunnel task is running but /healthz liveness failed. Restarting it.'
         }
         Stop-TunnelTaskIfRunning
     }
@@ -4985,6 +6104,7 @@ else {
     }
 
     Remove-Item -LiteralPath $HealthUrlFile -Force -Confirm:$false -ErrorAction SilentlyContinue
+    Remove-Item -LiteralPath $LegacyHealthUrlFile -Force -Confirm:$false -ErrorAction SilentlyContinue
     Start-ScheduledTask -TaskName $TaskName
 
     Write-Progress -Id 3 -ParentId 1 -Activity 'Tunnel runtime' -Status 'Waiting for /readyz...' -PercentComplete 50
@@ -4992,14 +6112,19 @@ else {
     if (-not (Wait-TunnelReady -TimeoutSeconds 60)) {
         $task = Get-ScheduledTask -TaskName $TaskName
         $info = Get-ScheduledTaskInfo -TaskName $TaskName
-
-        $runtimeLog = ''
-        if (Test-Path -LiteralPath (Join-Path $LogDir 'tunnel-runtime.log')) {
-            $runtimeLog = (Get-Content -LiteralPath (Join-Path $LogDir 'tunnel-runtime.log') -Tail 60) -join "`r`n"
-        }
-
         $publishedUrl = Get-TunnelHealthBaseUrl
-        throw "Tunnel runtime did not become ready within 60 seconds. TaskState=$($task.State), LastTaskResult=$($info.LastTaskResult), HealthURL=$publishedUrl`r`nRuntime log tail:`r`n$runtimeLog"
+
+        if (Test-TunnelHealth) {
+            $readyDetail = Get-TunnelLocalProbe -Path '/readyz' -TimeoutSeconds 3
+            Write-Warning "Tunnel became live but /readyz did not reach HTTP 200 within 60 seconds. Leaving the live tunnel running for bounded watchdog recovery. Status=$($readyDetail.StatusCode); Error=$($readyDetail.Error); Body=$($readyDetail.Body)"
+        }
+        else {
+            $runtimeLog = ''
+            if (Test-Path -LiteralPath (Join-Path $LogDir 'tunnel-runtime.log')) {
+                $runtimeLog = (Get-Content -LiteralPath (Join-Path $LogDir 'tunnel-runtime.log') -Tail 60) -join "`r`n"
+            }
+            throw "Tunnel runtime did not become live within 60 seconds. TaskState=$($task.State), LastTaskResult=$($info.LastTaskResult), HealthURL=$publishedUrl`r`nRuntime log tail:`r`n$runtimeLog"
+        }
     }
 
     Write-Progress -Id 3 -ParentId 1 -Activity 'Tunnel runtime' -Completed
@@ -5023,27 +6148,26 @@ if (-not $healthBaseUrl) {
     throw "The running tunnel did not publish a valid health URL to $HealthUrlFile"
 }
 
-if (-not (Test-TunnelReady)) {
-    throw "The tunnel runtime is running, but $healthBaseUrl/readyz is not returning HTTP 200."
+$healthProbe = Get-TunnelLocalProbe -Path '/healthz' -TimeoutSeconds 3
+if (-not $healthProbe.Ok) {
+    throw "The tunnel runtime is running but /healthz liveness failed. Status=$($healthProbe.StatusCode); Error=$($healthProbe.Error); Body=$($healthProbe.Body)"
 }
-
-try {
-    $healthResponse = Invoke-WebRequest `
-        -UseBasicParsing `
-        -Uri ($healthBaseUrl + '/healthz') `
-        -TimeoutSec 3 `
-        -ErrorAction Stop
-}
-catch {
-    throw "The tunnel runtime passed /readyz but /healthz could not be reached at $healthBaseUrl/healthz. $($_.Exception.Message)"
-}
-
-if ($healthResponse.StatusCode -ne 200) {
-    throw "The tunnel runtime /healthz endpoint returned HTTP $($healthResponse.StatusCode) instead of 200."
-}
-
 Write-Skip "Live tunnel health check passed: $healthBaseUrl/healthz"
-Write-Skip "Live tunnel readiness check passed: $healthBaseUrl/readyz"
+
+$readyProbe = Get-TunnelLocalProbe -Path '/readyz' -TimeoutSeconds 3
+if ($readyProbe.Ok) {
+    Write-Skip "Live tunnel readiness check passed: $healthBaseUrl/readyz"
+}
+else {
+    Write-Warning "Tunnel liveness is healthy, but /readyz is not currently HTTP 200. Status=$($readyProbe.StatusCode); Error=$($readyProbe.Error); Body=$($readyProbe.Body)"
+}
+
+# Migration cleanup: the previous .url file was a plain-text state file, not a
+# Windows Internet Shortcut. Remove it only after the new endpoint file is live.
+if (Test-Path -LiteralPath $LegacyHealthUrlFile) {
+    Remove-Item -LiteralPath $LegacyHealthUrlFile -Force -Confirm:$false -ErrorAction SilentlyContinue
+    Write-Fix "Removed obsolete health endpoint state file: $LegacyHealthUrlFile"
+}
 
 Write-Progress -Id 1 -Activity 'MediaStack Control Gateway installation' -Completed
 
@@ -5071,28 +6195,52 @@ Write-Host "Tunnel task       : $TaskName"
 Write-Host "Watchdog task     : $WatchdogTaskName"
 Write-Host "Runtime log       : $(Join-Path $LogDir 'tunnel-runtime.log')"
 Write-Host "Watchdog log      : $(Join-Path $LogDir 'tunnel-watchdog.log')"
+Write-Host "Health endpoint   : $HealthUrlFile"
+Write-Host "Open tunnel UI    : $OpenTunnelUiScript"
 Write-Host "Doctor log        : $doctorLog"
+Write-Host "Installer log     : $InstallerLog"
 Write-Host "Health URL        : $healthBaseUrl/healthz"
 Write-Host "Ready URL         : $healthBaseUrl/readyz"
 Write-Host "Local admin UI    : $healthBaseUrl/ui"
 Write-Host ""
 Write-Host "This installer is now safe to run again." -ForegroundColor Green
 Write-Host "Working stages will report SKIP; only missing/broken stages will be repaired." -ForegroundColor Green
-Write-Host "SELF-HEALING ENABLED: tunnel-client restarts automatically after exit, and a watchdog checks /readyz every minute." -ForegroundColor Green
+Write-Host "SELF-HEALING ENABLED: tunnel-client restarts automatically after exit; watchdog uses /healthz liveness plus bounded /readyz recovery ($WatchdogReadinessFailureThreshold failures, $WatchdogReadinessRestartCooldownMinutes-minute readiness restart cooldown)." -ForegroundColor Green
 Write-Host "COLLECTION METADATA ENABLED: read/update summaries, sort/display settings, labels, visibility, posters, and background art." -ForegroundColor Green
 Write-Host "ITEM SUMMARY METADATA ENABLED: read/update movie and TV show summaries by exact Plex rating key; edits are locked and preserve all other metadata." -ForegroundColor Green
 Write-Host "ITEM POSTER METADATA ENABLED: replace individual movie and TV show posters by exact Plex rating key from URL or local image; selected posters are locked." -ForegroundColor Green
+Write-Host "ADDED AT METADATA ENABLED: read/update movie, show, season, and episode addedAt values; exact and filtered bulk writes can reorder Recently Added without touching media files." -ForegroundColor Green
+Write-Host "HUB CACHE REFRESH ENABLED: non-destructively refresh/warm a library's transient Plex hubs and verify current Recently Added ordering." -ForegroundColor Green
+Write-Host "INSTALLER LOGGING ENABLED: full timestamped installer transcripts are stored under $LogDir." -ForegroundColor Green
+Write-Host "TUNNEL DIAGNOSTICS ENABLED: read-only timing and runtime-log diagnostics can measure response deadlines, TTL events, restarts, and transport failures." -ForegroundColor Green
+Write-Host "BOUNDED LOGGING ENABLED: runtime log rotates at $([math]::Round($RuntimeLogMaxBytes / 1MB)) MB with $RuntimeLogRetainedFiles retained files; watchdog log rotates at $([math]::Round($WatchdogLogMaxBytes / 1MB)) MB with $WatchdogLogRetainedFiles retained files; $InstallerLogRetainCount installer transcripts retained." -ForegroundColor Green
+Write-Host "HEALTH ENDPOINT STATE: dynamic localhost endpoint is stored as tunnel-health-endpoint.txt; Open-Tunnel-UI.ps1 opens the current admin UI." -ForegroundColor Green
 Write-Host "TAUTULLI REPORTING ENABLED: cached library counts, logical storage, media breakdowns, history/top stats, and local CSV/JSON exports." -ForegroundColor Green
 Write-Host "REPORTING DESIGN: normal questions return compact aggregates; full inventory data crosses the tunnel only when an export is explicitly requested." -ForegroundColor Green
 Write-Host "ARR MANAGEMENT ENABLED: Sonarr/Radarr/Lidarr reporting, adds/edits, explicit-path requests, bulk monitor/profile/search workflows, and inventory exports." -ForegroundColor Green
 Write-Host "ARR DELETE SAFETY: deletion requires prepare + explicit user confirmation + short-lived token; physical media deletion is separately bound to the prepared choice." -ForegroundColor Green
 Write-Host "EDITABLE ACL ENABLED: protected generated files also grant Full Control to the Windows account that ran this installer." -ForegroundColor Green
 if ($McpServerChanged) {
-    Write-Host "MCP CODE CHANGED: the tunnel runtime was restarted and the new tool schema is now live." -ForegroundColor Yellow
-    Write-Host "Refresh/Rescan the Plex app actions in ChatGPT now." -ForegroundColor Yellow
+    Write-Host "MCP CODE CHANGED: the tunnel runtime was restarted and the new tool schema is now live." -ForegroundColor Cyan
+    Write-Host "Refresh/Rescan the MediaStack Control Gateway app actions in ChatGPT now." -ForegroundColor Cyan
+}
+elseif ($profileChanged -or $TunnelRunnerChanged) {
+    Write-Host "TUNNEL RUNTIME UPDATED: profile/supervisor changes were loaded without changing the MCP tool schema." -ForegroundColor Cyan
 }
 Write-Host ""
 Write-Host "Next in ChatGPT:" -ForegroundColor Cyan
 Write-Host "  Settings -> Connectors/Apps -> add a developer MCP app -> Connection: Tunnel"
 Write-Host "  Select/paste tunnel: $TunnelId"
 Write-Host "  Scan tools."
+}
+finally {
+    if ($InstallerTranscriptActive) {
+        try {
+            Stop-Transcript | Out-Null
+        }
+        catch {
+            # Do not hide an installer result because transcript shutdown failed.
+        }
+        $InstallerTranscriptActive = $false
+    }
+}
