@@ -23,6 +23,20 @@
     LidarrUrl = '<REQUIRED: http://LIDARR-SERVER:8686>'
     LidarrApiKey = '<REQUIRED: Lidarr API key>'
 
-    # OPTIONAL. Change this only if you do not want the default install location.
+    # OPTIONAL. Local install path.
     InstallRoot = 'C:\Scripts\MediaStack-Control-Gateway'
+
+    # OPTIONAL. Logging limits and retention. Values must be positive integers.
+    RuntimeLogMaxMB = 25
+    RuntimeLogRetainedFiles = 3
+    WatchdogLogMaxMB = 5
+    WatchdogLogRetainedFiles = 3
+    InstallerLogRetainCount = 10
+
+    # OPTIONAL. Self-healing tunnel policy. Defaults are conservative and avoid
+    # restarting a live tunnel because of one transient readiness failure.
+    WatchdogReadinessFailureThreshold = 3
+    WatchdogReadinessRestartCooldownMinutes = 10
+    WatchdogStartupGraceSeconds = 90
+    WatchdogHealthyHeartbeatMinutes = 60
 }
