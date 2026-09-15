@@ -1,0 +1,42 @@
+name: Assemble v3.5.3 production installer
+
+on:
+  push:
+    branches:
+      - release-v3.5.3
+    paths:
+      - '.release-trigger'
+
+permissions:
+  contents: write
+
+jobs:
+  assemble:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out release branch
+        uses: actions/checkout@v4
+        with:
+          ref: release-v3.5.3
+
+      - name: Apply reviewed installer patch
+        shell: bash
+        run: |
+          set -euo pipefail
+          cat .release-patch/part* > /tmp/v353.patch
+          sed -i '1c--- a/Install-MediaStack-Control-Gateway.ps1' /tmp/v353.patch
+          sed -i '2c+++ b/Install-MediaStack-Control-Gateway.ps1' /tmp/v353.patch
+          git apply --check /tmp/v353.patch
+          git apply /tmp/v353.patch
+          echo '3a4bc621e48a26febde8a7ce7ead1d1f3aba299ec1b7079d4255816e9f5b0f38  Install-MediaStack-Control-Gateway.ps1' | sha256sum -c -
+          rm -rf .release-patch .release-plain .release-payload
+          rm -f .release-trigger
+
+      - name: Commit assembled production installer
+        shell: bash
+        run: |
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add -A
+          git commit -m 'Assemble v3.5.3 production installer'
+          git push origin HEAD:release-v3.5.3
