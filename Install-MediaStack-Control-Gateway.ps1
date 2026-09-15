@@ -1,7 +1,7 @@
 #requires -RunAsAdministrator
 <#
 MediaStack Control Gateway Installer for Windows Server
-v3.5.3
+v3.5.4
 
 MediaStack Control Gateway provides a private MCP control and reporting layer for
 Plex, Tautulli, Sonarr, Radarr, and Lidarr through OpenAI Secure MCP Tunnel.
@@ -27,6 +27,11 @@ v3.5.2
 v3.5.3
   * Made watched/unwatched writes idempotent so repeated requests do not
     increment Plex viewCount or perform unnecessary state writes.
+
+v3.5.4
+  * Fixed secure directory ACL inheritance so generated exports remain readable
+    by the installer user while staying restricted to SYSTEM, Administrators,
+    and that user. Existing child ACLs are repaired on rerun.
 
 Safety behavior:
   * Arr deletions require a short-lived prepare/confirm token.
@@ -160,7 +165,7 @@ $TaskName = 'MediaStack Control Gateway Tunnel'
 $WatchdogTaskName = 'MediaStack Control Gateway Tunnel Watchdog'
 $ProfileName = 'media-stack'
 $TotalStages = 12
-$GatewayVersion = '3.5.3'
+$GatewayVersion = '3.5.4'
 $ExpectedMcpToolCount = 96
 $ForceSchemaReload = $true
 $RequiredMcpTools = @(
@@ -483,24 +488,61 @@ function Set-SecureAcl {
         return
     }
 
-    # These files can contain embedded credentials, so keep them restricted to
-    # SYSTEM, local Administrators, and the Windows account running this installer.
-    # Previous versions granted only SYSTEM + Administrators. With UAC, that could
-    # make the files appear read-only when the same admin user opened an editor
-    # without elevation. Granting the invoking user's SID Full Control keeps the
-    # files private while still allowing that user to edit the PS1/Python files.
+    # Keep protected files/directories restricted to SYSTEM, local Administrators,
+    # and the Windows account running this installer. Directories must use
+    # inheritable ACEs so files created later by the SYSTEM-hosted MCP runtime are
+    # still readable by the installer user. v3.5.4 also repairs child ACLs created
+    # by earlier releases that removed inheritance from export directories.
     try {
+        $item = Get-Item -LiteralPath $Path -Force -ErrorAction Stop
         $currentIdentity = [System.Security.Principal.WindowsIdentity]::GetCurrent()
         $currentUserSid = $currentIdentity.User.Value
-        $currentUserGrant = '*{0}:(F)' -f $currentUserSid
 
-        & icacls.exe $Path /inheritance:r /grant:r `
-            '*S-1-5-18:(F)' `
-            '*S-1-5-32-544:(F)' `
-            $currentUserGrant | Out-Null
+        if ($item.PSIsContainer) {
+            $currentUserGrant = '*{0}:(OI)(CI)(F)' -f $currentUserSid
 
-        if ($LASTEXITCODE -ne 0) {
-            Write-Warning "Could not set editable secure ACL on $Path"
+            & icacls.exe $Path /inheritance:r /grant:r `
+                '*S-1-5-18:(OI)(CI)(F)' `
+                '*S-1-5-32-544:(OI)(CI)(F)' `
+                $currentUserGrant | Out-Null
+
+            if ($LASTEXITCODE -ne 0) {
+                Write-Warning "Could not set inheritable secure ACL on directory $Path"
+            }
+            else {
+                $children = @(Get-ChildItem -LiteralPath $Path -Force -ErrorAction SilentlyContinue)
+                if ($children.Count -gt 0) {
+                    # Older releases could create child files with no inheritable ACEs.
+                    # Take administrative ownership so their DACL can be repaired, then
+                    # reset each child to the restricted inherited ACL from the parent.
+                    & takeown.exe /F (Join-Path $Path '*') /A /R /D Y | Out-Null
+                    if ($LASTEXITCODE -ne 0) {
+                        Write-Warning "Could not take administrative ownership of one or more existing children under $Path"
+                    }
+
+                    & icacls.exe (Join-Path $Path '*') /inheritance:e /T /C | Out-Null
+                    if ($LASTEXITCODE -ne 0) {
+                        Write-Warning "Could not enable inheritance on one or more existing children under $Path"
+                    }
+
+                    & icacls.exe (Join-Path $Path '*') /reset /T /C | Out-Null
+                    if ($LASTEXITCODE -ne 0) {
+                        Write-Warning "Could not reset one or more existing child ACLs under $Path"
+                    }
+                }
+            }
+        }
+        else {
+            $currentUserGrant = '*{0}:(F)' -f $currentUserSid
+
+            & icacls.exe $Path /inheritance:r /grant:r `
+                '*S-1-5-18:(F)' `
+                '*S-1-5-32-544:(F)' `
+                $currentUserGrant | Out-Null
+
+            if ($LASTEXITCODE -ne 0) {
+                Write-Warning "Could not set editable secure ACL on file $Path"
+            }
         }
     }
     catch {
@@ -613,7 +655,7 @@ function Test-TunnelClient {
     }
 }
 
-Write-Host "MediaStack Control Gateway installer for Windows Server - v3.5.3 WATCH-STATE IDEMPOTENCE / VALIDATION FIXES / FORCE SCHEMA REFRESH / ACTIVE SESSIONS / GENERAL PLAYLISTS / ARR WANTED + CALENDAR / WATCHED STATE / LETTERBOXD EXPORT / WATCHDOG + LOG ROTATION / TUNNEL DIAGNOSTICS / ARR MANAGEMENT / TAUTULLI REPORTING / COLLECTION METADATA / IDEMPOTENT" -ForegroundColor Green
+Write-Host "MediaStack Control Gateway installer for Windows Server - v3.5.4 DIRECTORY ACL INHERITANCE FIX / WATCH-STATE IDEMPOTENCE / VALIDATION FIXES / FORCE SCHEMA REFRESH / ACTIVE SESSIONS / GENERAL PLAYLISTS / ARR WANTED + CALENDAR / WATCHED STATE / LETTERBOXD EXPORT / WATCHDOG + LOG ROTATION / TUNNEL DIAGNOSTICS / ARR MANAGEMENT / TAUTULLI REPORTING / COLLECTION METADATA / IDEMPOTENT" -ForegroundColor Green
 Write-Host "Safe to run repeatedly. Existing working components are skipped." -ForegroundColor Green
 Write-Host "Installer log: $InstallerLog" -ForegroundColor Green
 Write-Host "HARD NONINTERACTIVE MODE: all PowerShell confirmation prompts are suppressed." -ForegroundColor Green
@@ -6475,7 +6517,7 @@ if ($McpServerChanged) {
     Write-Fix 'MCP server definition changed. The tunnel runtime will be restarted so ChatGPT can discover the new tool schema.'
 }
 else {
-    Write-Skip 'MCP server definition is unchanged, but v3.5.3 will still force a clean runtime restart to prevent a stale resident schema.'
+    Write-Skip 'MCP server definition is unchanged, but v3.5.4 will still force a clean runtime restart to prevent a stale resident schema.'
 }
 
 # ===========================================================================
@@ -7269,7 +7311,7 @@ else {
             Write-Fix 'Tunnel supervisor changed. Restarting the runtime to load the new supervisor/log-rotation behavior.'
         }
         elseif ($ForceSchemaReload) {
-            Write-Fix 'Forcing a clean tunnel restart so only the verified v3.5.3 MCP schema remains resident.'
+            Write-Fix 'Forcing a clean tunnel restart so only the verified v3.5.4 MCP schema remains resident.'
         }
         else {
             Write-Fix 'Tunnel task is running but /healthz liveness failed. Restarting it.'
