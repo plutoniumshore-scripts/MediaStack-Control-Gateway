@@ -1,40 +1,42 @@
 #requires -RunAsAdministrator
 <#
 MediaStack Control Gateway Installer for Windows Server
-v3.4.10 - WATCHDOG + LOG ROTATION / TUNNEL DIAGNOSTICS / ARR STATUS + COLORING / INSTALLER LOGGING / HUB CACHE REFRESH / ADDED AT METADATA / EPISODE METADATA / ITEM POSTER METADATA / ITEM SUMMARY METADATA / ARR MANAGEMENT / TAUTULLI REPORTING / COLLECTION METADATA / SELF-HEALING TUNNEL / IDEMPOTENT
+v3.5.3
 
-Safe to run repeatedly.
+MediaStack Control Gateway provides a private MCP control and reporting layer for
+Plex, Tautulli, Sonarr, Radarr, and Lidarr through OpenAI Secure MCP Tunnel.
 
-Behavior:
-  * Reuses a working tunnel-client and application-local Python installation.
-  * Installs Python packages only when imports fail.
-  * Rewrites the generated MCP server only when its content changes.
-  * Reuses or repairs the tunnel profile and Scheduled Tasks as needed.
-  * Keeps generated PowerShell/Python/config files editable by the invoking Windows user while retaining restricted ACLs.
-  * Provides Plex library, collection, smart-collection, metadata, artwork, episode, playlist, addedAt/Touch, and transient-hub tools.
-  * Provides Tautulli-backed reporting and controlled local CSV/JSON export workflows.
-  * Provides Sonarr, Radarr, and Lidarr reporting and controlled management workflows.
-  * v3.4.4 adds read/write metadata tools for individual TV episodes.
-  * v3.4.5 adds addedAt metadata controls for movies, shows, seasons, and episodes for Recently Added ordering.
-  * v3.4.6 adds non-destructive Plex transient-hub refresh/warm plus Recently Added verification.
-  * v3.4.7 adds timestamped full installer transcript logging.
-  * v3.4.8 fixes current nested Arr status parsing and normalizes console severity colors.
-  * v3.4.9 adds read-only tunnel timing and bounded runtime diagnostics.
-  * v3.4.10 separates tunnel liveness from readiness to prevent restart storms, adds readiness thresholds/cooldowns/startup grace, bounded UTF-8 runtime/watchdog logs, installer-log retention, a clearly named health endpoint state file, and a dynamic local admin UI launcher.
-  * Arr deletions require a short-lived prepared confirmation token before the destructive call can execute.
-  * New Radarr/Sonarr/Lidarr requests require an explicit root folder/profile instead of guessing storage paths.
+The installer is noninteractive and safe to run repeatedly. It manages an
+application-local Python runtime, the MCP server, the tunnel profile, scheduled
+tasks, bounded logs, health monitoring, and local reporting/export directories.
 
-By default, working files live under:
+v3.5.0
+  * Added active Plex sessions, regular playlist management, Arr wanted/missing
+    and calendar queries, reversible watched/unwatched controls, and
+    Plex-account-scoped Letterboxd Full/Delta/Custom CSV exports.
+
+v3.5.1
+  * Added generated-schema validation and forced managed-runtime refresh so a
+    stale local MCP schema cannot remain active after an installer update.
+
+v3.5.2
+  * Fixed post-mutation playlist counts, added read-only watch-state inspection,
+    structured validation/not-found results, Arr duplicate prechecks, and
+    post-timeout verification for Arr additions.
+
+v3.5.3
+  * Made watched/unwatched writes idempotent so repeated requests do not
+    increment Plex viewCount or perform unnecessary state writes.
+
+Safety behavior:
+  * Arr deletions require a short-lived prepare/confirm token.
+  * New Radarr/Sonarr/Lidarr additions require an explicit root folder/profile.
+  * The tunnel health/admin listener binds only to loopback.
+  * Credentials and environment-specific addresses are loaded from the local
+    MediaStack-Control-Gateway.config.psd1 file, which should never be committed.
+
+Default install root:
   C:\Scripts\MediaStack-Control-Gateway
-
-The install root and operational thresholds can be changed in the local configuration file.
-
-This script is intentionally NONINTERACTIVE.
-
-PUBLIC REPOSITORY NOTE:
-  Credentials and environment-specific addresses are loaded from the local
-  MediaStack-Control-Gateway.config.psd1 file. Do not place secrets directly
-  into this installer or commit the real config file to source control.
 #>
 
 Set-StrictMode -Version Latest
@@ -71,11 +73,10 @@ catch {
 # ===========================================================================
 # Local configuration
 # ===========================================================================
-# Secrets and environment-specific values are intentionally kept outside this
-# installer. Copy MediaStack-Control-Gateway.config.example.psd1 to
-# MediaStack-Control-Gateway.config.psd1, then replace every <REQUIRED: ...>
-# placeholder before running the installer. The real config file is excluded
-# by the repository .gitignore.
+# Copy MediaStack-Control-Gateway.config.example.psd1 to
+# MediaStack-Control-Gateway.config.psd1 and replace every <REQUIRED: ...>
+# placeholder before running the installer. The real config file is excluded by
+# the repository .gitignore and receives a restricted local ACL during setup.
 $ConfigFileName = 'MediaStack-Control-Gateway.config.psd1'
 $ConfigPath = Join-Path $PSScriptRoot $ConfigFileName
 
@@ -128,13 +129,13 @@ $DownloadDir = Join-Path $Root 'downloads'
 $ProfileDir = Join-Path $Root 'profiles'
 $LogDir = Join-Path $Root 'logs'
 $ReportingExportDir = Join-Path $Root 'reporting-exports'
+$LetterboxdExportDir = Join-Path $Root 'Letterboxd-Exports'
 $HealthUrlFile = Join-Path $LogDir 'tunnel-health-endpoint.txt'
 $LegacyHealthUrlFile = Join-Path $LogDir 'tunnel-health.url'
 $WatchdogStateFile = Join-Path $LogDir 'tunnel-watchdog-state.json'
 $OpenTunnelUiScript = Join-Path $Root 'Open-Tunnel-UI.ps1'
 
-# Managed log/watchdog policy. Defaults are conservative and can be overridden
-# in the local configuration file.
+# Managed log/watchdog policy. Defaults can be overridden in the local configuration file.
 $RuntimeLogMaxBytes = (Get-OptionalPositiveInt -Name 'RuntimeLogMaxMB' -Default 25) * 1MB
 $RuntimeLogRetainedFiles = Get-OptionalPositiveInt -Name 'RuntimeLogRetainedFiles' -Default 3
 $WatchdogLogMaxBytes = (Get-OptionalPositiveInt -Name 'WatchdogLogMaxMB' -Default 5) * 1MB
@@ -159,6 +160,25 @@ $TaskName = 'MediaStack Control Gateway Tunnel'
 $WatchdogTaskName = 'MediaStack Control Gateway Tunnel Watchdog'
 $ProfileName = 'media-stack'
 $TotalStages = 12
+$GatewayVersion = '3.5.3'
+$ExpectedMcpToolCount = 96
+$ForceSchemaReload = $true
+$RequiredMcpTools = @(
+    'plex_active_sessions',
+    'plex_get_playlist_items',
+    'plex_create_playlist',
+    'plex_add_playlist_items',
+    'plex_remove_playlist_items',
+    'plex_clear_playlist',
+    'plex_delete_playlist',
+    'plex_get_watch_state',
+    'plex_mark_watched',
+    'plex_mark_unwatched',
+    'letterboxd_export',
+    'arr_wanted',
+    'arr_calendar'
+)
+$SchemaStateFile = Join-Path $Root 'mcp-schema-state.json'
 
 # ===========================================================================
 # Timestamped installer transcript logging
@@ -328,6 +348,45 @@ function Stop-TunnelTaskIfRunning {
             Start-Sleep -Milliseconds 500
             $task = Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue
         } while ($task -and $task.State -eq 'Running' -and (Get-Date) -lt $deadline)
+    }
+}
+
+function Stop-ManagedTunnelProcesses {
+    # A stopped scheduled task can leave child processes behind. An orphaned old
+    # tunnel-client can continue polling the same tunnel ID and keep serving an
+    # obsolete MCP schema. Only processes belonging to this managed install root
+    # are terminated here.
+    $managedRootNormalized = $Root.Replace('/', '\').ToLowerInvariant()
+    $targets = @()
+
+    try {
+        $targets = @(Get-CimInstance Win32_Process -ErrorAction Stop | Where-Object {
+            $name = [string]$_.Name
+            $exe = ([string]$_.ExecutablePath).Replace('/', '\').ToLowerInvariant()
+            $cmd = ([string]$_.CommandLine).Replace('/', '\').ToLowerInvariant()
+
+            (($name -ieq 'tunnel-client.exe') -and (($exe -eq $TunnelExe.ToLowerInvariant()) -or $cmd.Contains($managedRootNormalized))) -or
+            (($name -ieq 'cloudflared.exe') -and (($exe -eq $CloudflaredExe.ToLowerInvariant()) -or $cmd.Contains($managedRootNormalized))) -or
+            (($name -ieq 'python.exe') -and ($cmd.Contains($McpServer.Replace('/', '\').ToLowerInvariant())))
+        })
+    }
+    catch {
+        Write-Warning "Unable to enumerate managed tunnel child processes: $($_.Exception.Message)"
+        return
+    }
+
+    foreach ($process in $targets) {
+        try {
+            Write-Fix "Stopping stale managed process $($process.Name) PID $($process.ProcessId)."
+            Stop-Process -Id ([int]$process.ProcessId) -Force -ErrorAction Stop
+        }
+        catch {
+            Write-Warning "Unable to stop managed process PID $($process.ProcessId): $($_.Exception.Message)"
+        }
+    }
+
+    if ($targets.Count -gt 0) {
+        Start-Sleep -Seconds 2
     }
 }
 
@@ -554,7 +613,7 @@ function Test-TunnelClient {
     }
 }
 
-Write-Host "MediaStack Control Gateway installer for Windows Server - v3.4.10 WATCHDOG + LOG ROTATION / TUNNEL DIAGNOSTICS / ARR STATUS + COLORING / INSTALLER LOGGING / HUB CACHE REFRESH / ADDED AT METADATA / EPISODE METADATA / ITEM POSTER METADATA / ITEM SUMMARY METADATA / ARR MANAGEMENT / TAUTULLI REPORTING / COLLECTION METADATA / SELF-HEALING TUNNEL / IDEMPOTENT" -ForegroundColor Green
+Write-Host "MediaStack Control Gateway installer for Windows Server - v3.5.3 WATCH-STATE IDEMPOTENCE / VALIDATION FIXES / FORCE SCHEMA REFRESH / ACTIVE SESSIONS / GENERAL PLAYLISTS / ARR WANTED + CALENDAR / WATCHED STATE / LETTERBOXD EXPORT / WATCHDOG + LOG ROTATION / TUNNEL DIAGNOSTICS / ARR MANAGEMENT / TAUTULLI REPORTING / COLLECTION METADATA / IDEMPOTENT" -ForegroundColor Green
 Write-Host "Safe to run repeatedly. Existing working components are skipped." -ForegroundColor Green
 Write-Host "Installer log: $InstallerLog" -ForegroundColor Green
 Write-Host "HARD NONINTERACTIVE MODE: all PowerShell confirmation prompts are suppressed." -ForegroundColor Green
@@ -610,7 +669,7 @@ foreach ($service in @(
     }
 }
 
-foreach ($dir in @($Root, $BinDir, $DownloadDir, $ProfileDir, $LogDir, $ReportingExportDir)) {
+foreach ($dir in @($Root, $BinDir, $DownloadDir, $ProfileDir, $LogDir, $ReportingExportDir, $LetterboxdExportDir)) {
     if (Test-Path -LiteralPath $dir) {
         Write-Skip "$dir already exists."
     }
@@ -623,6 +682,7 @@ foreach ($dir in @($Root, $BinDir, $DownloadDir, $ProfileDir, $LogDir, $Reportin
 # Restrict the local configuration because it contains credentials.
 Set-SecureAcl -Path $ConfigPath
 Set-SecureAcl -Path $ReportingExportDir
+Set-SecureAcl -Path $LetterboxdExportDir
 
 # ===========================================================================
 # 2. Install/reuse OpenAI tunnel-client
@@ -905,13 +965,14 @@ else {
 }
 
 # ===========================================================================
-# 5. Create/update MediaStack Control Gateway MCP server
+# 5. Create/update Plex MCP server
 # ===========================================================================
-Show-Stage 5 'Create or update MediaStack Control Gateway MCP server'
+Show-Stage 5 'Create or update Plex MCP server'
 
 $pythonServer = @'
 import base64
 import csv
+import io
 import json
 import logging
 import os
@@ -919,7 +980,7 @@ import re
 import secrets
 import time
 import uuid
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Optional
 from urllib.error import HTTPError, URLError
@@ -943,18 +1004,19 @@ RADARR_API_KEY = "__RADARR_API_KEY__"
 LIDARR_URL = "__LIDARR_URL__"
 LIDARR_API_KEY = "__LIDARR_API_KEY__"
 REPORT_EXPORT_DIR = "__REPORT_EXPORT_DIR__"
+LETTERBOXD_EXPORT_DIR = "__LETTERBOXD_EXPORT_DIR__"
 TUNNEL_RUNTIME_LOG = "__TUNNEL_RUNTIME_LOG__"
 TUNNEL_HEALTH_URL_FILE = "__TUNNEL_HEALTH_URL_FILE__"
 
 logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger("media-stack-control-gateway")
+logger = logging.getLogger("plex-mcp")
 
 mcp = MCPServer(
     "Plex",
     instructions=(
         "Tools for visibility across all Plex libraries and collections, regular collection "
-        "management, collection metadata management, individual movie/show summary and poster metadata management, movie/show/season/episode added-at metadata management, non-destructive Plex transient-hub refresh and Recently Added verification, individual TV episode metadata management, read-only tunnel timing/runtime diagnostics, smart collection filter management, narrowly "
-        "scoped TV episode playlist creation, Tautulli-backed reporting, and Sonarr/Radarr/Lidarr management. "
+        "management, collection metadata management, individual movie/show summary and poster metadata management, movie/show/season/episode added-at metadata management, non-destructive Plex transient-hub refresh and Recently Added verification, individual TV episode metadata management, read-only tunnel timing/runtime diagnostics, smart collection filter management, "
+        "general regular-playlist management, active playback sessions, watched-state management, Plex-account-scoped Letterboxd CSV exports, Tautulli-backed reporting, and Sonarr/Radarr/Lidarr management including wanted and calendar queries. "
         "Use plex_reporting_* for Plex analytics and arr_*/sonarr_*/radarr_*/lidarr_* for Arr reporting and management. "
         "Large datasets should be processed locally and summarized before crossing the tunnel. Resolve exact items with read tools "
         "before writes. New media requests must use an explicitly selected root folder/profile and must never guess a storage path. "
@@ -1339,7 +1401,7 @@ def _local_tunnel_probe(path: str, timeout: int = 3) -> dict:
     if not re.match(r"^http://127\.0\.0\.1:\d+$", base):
         return {"available": False, "error": "Tunnel health endpoint file did not contain a valid loopback URL."}
     try:
-        with urlopen(Request(base + path, headers={"User-Agent": "MediaStack-Control-Gateway-Diagnostics/3.4.10"}), timeout=timeout) as response:
+        with urlopen(Request(base + path, headers={"User-Agent": "MediaStack-Control-Gateway-Diagnostics/3.5.3"}), timeout=timeout) as response:
             raw = response.read(4096).decode("utf-8", errors="replace")
             return {"available": True, "status_code": int(response.status), "body": raw[:1000]}
     except HTTPError as exc:
@@ -2365,6 +2427,19 @@ def plex_set_item_poster(
     image_url: Optional[str] = None,
     local_filepath: Optional[str] = None,
 ) -> dict:
+    # Validate the source before contacting Plex so common caller mistakes return
+    # a normal structured tool result instead of surfacing as a generic MCP error.
+    try:
+        image_url, local_filepath = _validate_image_source(image_url, local_filepath)
+    except ValueError as exc:
+        return {
+            "changed": False,
+            "reason": "invalid_source",
+            "message": str(exc),
+            "library": str(library_name),
+            "rating_key": str(rating_key),
+        }
+
     server = _plex()
     section = _exact_section(server, library_name)
     items = _load_rating_key_items(server, section, [rating_key])
@@ -2373,9 +2448,15 @@ def plex_set_item_poster(
 
     item_type = getattr(item, "TYPE", None) or item.__class__.__name__.lower()
     if item_type not in {"movie", "show"}:
-        raise ValueError("plex_set_item_poster currently supports movie and show items only.")
+        return {
+            "changed": False,
+            "reason": "unsupported_type",
+            "message": "plex_set_item_poster currently supports movie and show items only.",
+            "library": section.title,
+            "rating_key": str(getattr(item, "ratingKey", rating_key)),
+            "type": item_type,
+        }
 
-    image_url, local_filepath = _validate_image_source(image_url, local_filepath)
     previous_thumb = getattr(item, "thumb", None)
 
     item.uploadPoster(url=image_url, filepath=local_filepath)
@@ -3211,6 +3292,797 @@ def plex_create_tv_playlist(
 
 
 # ===========================================================================
+# v3.5.0 Plex sessions / general playlists / watched state / Letterboxd export
+# ===========================================================================
+
+def _first_or_none(value):
+    if value is None:
+        return None
+    if isinstance(value, (list, tuple)):
+        return value[0] if value else None
+    return value
+
+
+def _safe_getattr(obj, name, default=None):
+    if obj is None:
+        return default
+    try:
+        return getattr(obj, name, default)
+    except Exception:
+        return default
+
+
+def _exact_playlist(server: PlexServer, playlist_title: str):
+    title = str(playlist_title or "").strip()
+    if not title:
+        raise ValueError("Playlist title cannot be empty.")
+    matches = [p for p in server.playlists() if str(p.title).casefold() == title.casefold()]
+    if not matches:
+        raise ValueError(f"Playlist not found: {title}")
+    if len(matches) != 1:
+        raise ValueError(f"Playlist title is ambiguous: {title}")
+    return matches[0]
+
+
+def _load_playlist_items(server: PlexServer, rating_keys: list[str]) -> list:
+    if not rating_keys:
+        raise ValueError("At least one Plex rating key is required.")
+    items = []
+    missing = []
+    for raw_key in rating_keys:
+        try:
+            key = int(str(raw_key).strip())
+        except Exception as exc:
+            raise ValueError(f"Invalid Plex rating key: {raw_key}") from exc
+        try:
+            item = server.fetchItem(key)
+        except Exception:
+            missing.append(str(key))
+            continue
+        if not _safe_getattr(item, "listType"):
+            raise ValueError(f"Rating key {key} is not a playlist-compatible Plex media item.")
+        items.append(item)
+    if missing:
+        raise ValueError(f"These Plex rating keys could not be found: {', '.join(missing)}")
+    list_types = {str(_safe_getattr(item, "listType")) for item in items}
+    if len(list_types) != 1:
+        raise ValueError("A Plex playlist cannot mix video, audio, and photo item types.")
+    return items
+
+
+def _playlist_item_summary(item, position: int) -> dict:
+    result = _item_summary(item, _safe_getattr(item, "librarySectionTitle"))
+    result["position"] = position
+    result["playlist_item_id"] = _safe_getattr(item, "playlistItemID")
+    return result
+
+
+@mcp.tool(
+    description=(
+        "Return all currently active Plex playback sessions, including user, media identity, player, playback state, "
+        "progress, local/remote location, stream decision, resolution, and available bandwidth/bitrate details. Read-only."
+    ),
+    annotations=ToolAnnotations(read_only_hint=True, idempotent_hint=True),
+)
+def plex_active_sessions() -> dict:
+    server = _plex()
+    sessions = []
+    for item in server.sessions():
+        player = _first_or_none(_safe_getattr(item, "player"))
+        user = _first_or_none(_safe_getattr(item, "user"))
+        session = _first_or_none(_safe_getattr(item, "session"))
+        transcode = _first_or_none(_safe_getattr(item, "transcodeSession"))
+        media = _first_or_none(_safe_getattr(item, "media"))
+        duration = _safe_getattr(item, "duration") or 0
+        offset = _safe_getattr(item, "viewOffset") or 0
+        try:
+            progress = round((float(offset) / float(duration)) * 100.0, 1) if duration else None
+        except Exception:
+            progress = None
+        sessions.append({
+            "rating_key": str(_safe_getattr(item, "ratingKey") or "") or None,
+            "session_key": _safe_getattr(item, "sessionKey"),
+            "type": _safe_getattr(item, "type") or _safe_getattr(item, "TYPE"),
+            "title": _safe_getattr(item, "title"),
+            "grandparent_title": _safe_getattr(item, "grandparentTitle"),
+            "parent_title": _safe_getattr(item, "parentTitle"),
+            "user": _safe_getattr(user, "title") or _safe_getattr(user, "username"),
+            "player": {
+                "title": _safe_getattr(player, "title"),
+                "product": _safe_getattr(player, "product"),
+                "platform": _safe_getattr(player, "platform"),
+                "state": _safe_getattr(player, "state"),
+                "address": _safe_getattr(player, "address"),
+                "local": _safe_getattr(player, "local"),
+                "relayed": _safe_getattr(player, "relayed"),
+                "secure": _safe_getattr(player, "secure"),
+            },
+            "location": _safe_getattr(session, "location"),
+            "view_offset_ms": offset,
+            "duration_ms": duration,
+            "progress_percent": progress,
+            "stream": {
+                "video_decision": _safe_getattr(transcode, "videoDecision"),
+                "audio_decision": _safe_getattr(transcode, "audioDecision"),
+                "subtitle_decision": _safe_getattr(transcode, "subtitleDecision"),
+                "transcode_speed": _safe_getattr(transcode, "speed"),
+                "bandwidth_kbps": _safe_getattr(transcode, "bandwidth"),
+                "video_resolution": _safe_getattr(media, "videoResolution"),
+                "video_codec": _safe_getattr(media, "videoCodec"),
+                "audio_codec": _safe_getattr(media, "audioCodec"),
+                "media_bitrate_kbps": _safe_getattr(media, "bitrate"),
+            },
+        })
+    return {"session_count": len(sessions), "active_sessions": sessions}
+
+
+@mcp.tool(
+    description="List all items in one exact Plex playlist in playlist order. Read-only.",
+    annotations=ToolAnnotations(read_only_hint=True, idempotent_hint=True),
+)
+def plex_get_playlist_items(playlist_title: str) -> dict:
+    server = _plex()
+    playlist = _exact_playlist(server, playlist_title)
+    items = list(playlist.items())
+    return {
+        "playlist": playlist.title,
+        "rating_key": str(playlist.ratingKey),
+        "smart": bool(playlist.smart),
+        "playlist_type": playlist.playlistType,
+        "item_count": len(items),
+        "items": [_playlist_item_summary(item, index + 1) for index, item in enumerate(items)],
+    }
+
+
+@mcp.tool(
+    description=(
+        "Create a regular Plex playlist from exact Plex rating keys. Movies and TV episodes may be mixed because both are video; "
+        "video/audio/photo types cannot be mixed. Existing playlists are preserved unless replace_existing is explicitly true."
+    ),
+    annotations=ToolAnnotations(read_only_hint=False, destructive_hint=False, idempotent_hint=False),
+)
+def plex_create_playlist(name: str, rating_keys: list[str], replace_existing: bool = False) -> dict:
+    server = _plex()
+    title = str(name or "").strip()
+    if not title:
+        raise ValueError("Playlist name cannot be empty.")
+    items = _load_playlist_items(server, rating_keys)
+    existing = [p for p in server.playlists() if str(p.title).casefold() == title.casefold()]
+    if existing and not replace_existing:
+        return {"created": False, "reason": "playlist_exists", "playlist": existing[0].title, "items": existing[0].leafCount}
+    if replace_existing:
+        for playlist in existing:
+            playlist.delete()
+    created = Playlist.create(server, title, items=items)
+    return {"created": True, "playlist": created.title, "rating_key": str(created.ratingKey), "item_count": len(items)}
+
+
+@mcp.tool(
+    description="Add exact Plex rating keys to an existing regular playlist. Does not alter or delete underlying media.",
+    annotations=ToolAnnotations(read_only_hint=False, destructive_hint=False, idempotent_hint=False),
+)
+def plex_add_playlist_items(playlist_title: str, rating_keys: list[str]) -> dict:
+    server = _plex()
+    playlist = _exact_playlist(server, playlist_title)
+    if playlist.smart:
+        raise ValueError("Smart playlists cannot accept manually added items.")
+    items = _load_playlist_items(server, rating_keys)
+    item_type = str(_safe_getattr(items[0], "listType")) if items else None
+    if item_type != str(playlist.playlistType):
+        raise ValueError(f"Playlist '{playlist.title}' is type '{playlist.playlistType}' and cannot accept '{item_type}' items.")
+    before = len(playlist.items())
+    playlist.addItems(items)
+    playlist.reload()
+    after = len(playlist.items())
+    return {"playlist": playlist.title, "added_requested": len(items), "item_count_before": before, "item_count_after": after}
+
+
+@mcp.tool(
+    description="Remove exact Plex rating keys from an existing regular playlist. Underlying media is never deleted.",
+    annotations=ToolAnnotations(read_only_hint=False, destructive_hint=False, idempotent_hint=True),
+)
+def plex_remove_playlist_items(playlist_title: str, rating_keys: list[str]) -> dict:
+    server = _plex()
+    playlist = _exact_playlist(server, playlist_title)
+    if playlist.smart:
+        raise ValueError("Smart playlists cannot have items manually removed.")
+    wanted = {str(int(str(key).strip())) for key in rating_keys}
+    current = list(playlist.items())
+    matches = [item for item in current if str(_safe_getattr(item, "ratingKey")) in wanted]
+    missing = sorted(wanted - {str(_safe_getattr(item, "ratingKey")) for item in matches})
+    if matches:
+        playlist.removeItems(matches)
+        # PlexAPI can retain the pre-mutation playlist leaf cache on the object.
+        # Reload and resolve the playlist again before reporting the final count.
+        try:
+            playlist.reload()
+        except Exception:
+            pass
+        playlist = _exact_playlist(server, playlist.title)
+    remaining = list(playlist.items())
+    return {
+        "playlist": playlist.title,
+        "removed": len(matches),
+        "not_present": missing,
+        "item_count_before": len(current),
+        "item_count_after": len(remaining),
+    }
+
+
+@mcp.tool(
+    description="Remove every item from one regular Plex playlist while leaving the playlist definition in place. Underlying media is never deleted.",
+    annotations=ToolAnnotations(read_only_hint=False, destructive_hint=True, idempotent_hint=True),
+)
+def plex_clear_playlist(playlist_title: str) -> dict:
+    server = _plex()
+    playlist = _exact_playlist(server, playlist_title)
+    if playlist.smart:
+        raise ValueError("Smart playlists cannot be cleared by removing items.")
+    items = list(playlist.items())
+    if items:
+        playlist.removeItems(items)
+        # Force a fresh object so item_count_after reflects Plex's persisted state
+        # rather than PlexAPI's pre-mutation playlist cache.
+        try:
+            playlist.reload()
+        except Exception:
+            pass
+        playlist = _exact_playlist(server, playlist.title)
+    return {"playlist": playlist.title, "removed": len(items), "item_count_after": len(playlist.items())}
+
+
+@mcp.tool(
+    description="Delete one Plex playlist definition. This never deletes any underlying media files or library items.",
+    annotations=ToolAnnotations(read_only_hint=False, destructive_hint=True, idempotent_hint=False),
+)
+def plex_delete_playlist(playlist_title: str) -> dict:
+    server = _plex()
+    playlist = _exact_playlist(server, playlist_title)
+    before = {"playlist": playlist.title, "rating_key": str(playlist.ratingKey), "smart": bool(playlist.smart), "item_count": playlist.leafCount}
+    playlist.delete()
+    return {"deleted": True, **before, "media_deleted": False}
+
+
+@mcp.tool(
+    description=(
+        "Read watched/progress state for exact Plex movie/show/season/episode rating keys for the configured Plex user. "
+        "Returns watched state, view count, view offset, duration, and last-viewed time without making changes."
+    ),
+    annotations=ToolAnnotations(read_only_hint=True, idempotent_hint=True),
+)
+def plex_get_watch_state(library_name: str, rating_keys: list[str]) -> dict:
+    if not rating_keys:
+        return {
+            "success": False,
+            "reason": "empty_input",
+            "message": "At least one Plex rating key is required.",
+            "library": str(library_name),
+            "items": [],
+        }
+
+    server = _plex()
+    section = _exact_section(server, library_name)
+    items = _load_rating_key_items(server, section, rating_keys, require_same_type=False)
+    results = []
+    for item in items:
+        try:
+            item.reload()
+        except Exception:
+            pass
+        item_type = str(_safe_getattr(item, "type") or _safe_getattr(item, "TYPE") or "").casefold()
+        if item_type not in {"movie", "show", "season", "episode"}:
+            return {
+                "success": False,
+                "reason": "unsupported_type",
+                "message": f"Rating key {item.ratingKey} is type '{item_type}', not a watchable Plex video item.",
+                "library": section.title,
+                "items": results,
+            }
+        view_count = int(_safe_getattr(item, "viewCount", 0) or 0)
+        watched = bool(_safe_getattr(item, "isWatched", view_count > 0))
+        last_viewed = _safe_getattr(item, "lastViewedAt")
+        results.append({
+            "rating_key": str(item.ratingKey),
+            "title": _safe_getattr(item, "title"),
+            "type": item_type,
+            "watched": watched,
+            "view_count": view_count,
+            "view_offset": int(_safe_getattr(item, "viewOffset", 0) or 0),
+            "duration": int(_safe_getattr(item, "duration", 0) or 0),
+            "last_viewed_at": last_viewed.isoformat() if hasattr(last_viewed, "isoformat") else last_viewed,
+        })
+    return {"success": True, "library": section.title, "item_count": len(results), "items": results}
+
+
+def _set_watched_state(library_name: str, rating_keys: list[str], watched: bool) -> dict:
+    if not rating_keys:
+        return {
+            "success": False,
+            "reason": "empty_input",
+            "message": "At least one Plex rating key is required.",
+            "library": str(library_name),
+            "target_state": "watched" if watched else "unwatched",
+            "changed_count": 0,
+            "processed_count": 0,
+            "items": [],
+        }
+    server = _plex()
+    section = _exact_section(server, library_name)
+    items = _load_rating_key_items(server, section, rating_keys, require_same_type=False)
+    results = []
+    for item in items:
+        item_type = str(_safe_getattr(item, "type") or _safe_getattr(item, "TYPE") or "").casefold()
+        if item_type not in {"movie", "show", "season", "episode"}:
+            raise ValueError(f"Rating key {item.ratingKey} is type '{item_type}', not a watchable Plex video item.")
+        before_count = int(_safe_getattr(item, "viewCount", 0) or 0)
+        before_watched = bool(_safe_getattr(item, "isWatched", before_count > 0))
+        # Plex increments viewCount when markWatched() is called even if the item
+        # is already watched. Make the operation idempotent by skipping the Plex
+        # write entirely when the requested state already matches.
+        if before_watched != watched:
+            if watched:
+                item.markWatched()
+            else:
+                item.markUnwatched()
+            try:
+                item.reload()
+            except Exception:
+                pass
+        after_count = int(_safe_getattr(item, "viewCount", 0) or 0)
+        after_watched = bool(_safe_getattr(item, "isWatched", after_count > 0))
+        results.append({
+            "rating_key": str(item.ratingKey),
+            "title": _safe_getattr(item, "title"),
+            "type": item_type,
+            "before_watched": before_watched,
+            "after_watched": after_watched,
+            "before_view_count": before_count,
+            "after_view_count": after_count,
+        })
+    changed_count = sum(1 for row in results if row["before_watched"] != row["after_watched"])
+    return {
+        "success": True,
+        "library": section.title,
+        "target_state": "watched" if watched else "unwatched",
+        "processed_count": len(results),
+        "changed_count": changed_count,
+        "items": results,
+    }
+
+
+@mcp.tool(
+    description=(
+        "Mark exact Plex movie/show/season/episode rating keys watched for the configured Plex user. "
+        "For shows or seasons Plex applies watched state to their contained episodes. Reversible with plex_mark_unwatched."
+    ),
+    annotations=ToolAnnotations(read_only_hint=False, destructive_hint=False, idempotent_hint=True),
+)
+def plex_mark_watched(library_name: str, rating_keys: list[str]) -> dict:
+    return _set_watched_state(library_name, rating_keys, True)
+
+
+@mcp.tool(
+    description=(
+        "Mark exact Plex movie/show/season/episode rating keys unwatched for the configured Plex user. "
+        "For shows or seasons Plex applies unwatched state to their contained episodes. Reversible with plex_mark_watched."
+    ),
+    annotations=ToolAnnotations(read_only_hint=False, destructive_hint=False, idempotent_hint=True),
+)
+def plex_mark_unwatched(library_name: str, rating_keys: list[str]) -> dict:
+    return _set_watched_state(library_name, rating_keys, False)
+
+
+LETTERBOXD_COLUMNS = ["tmdbID", "imdbID", "Title", "Year", "Rating10", "WatchedDate", "Rewatch"]
+LETTERBOXD_MAX_FILE_BYTES = 950000
+
+
+def _plex_token_account(server: PlexServer) -> dict:
+    try:
+        account = server.myPlexAccount()
+    except Exception as exc:
+        raise RuntimeError(
+            "Unable to resolve the Plex account associated with the configured Plex token. "
+            "Letterboxd export is aborted rather than risk using unfiltered server-wide history."
+        ) from exc
+    account_id = _safe_getattr(account, "id")
+    if account_id is None:
+        raise RuntimeError("Plex account ID could not be resolved from the configured token; Letterboxd export aborted.")
+    return {
+        "id": int(account_id),
+        "username": _safe_getattr(account, "username"),
+        "friendly_name": _safe_getattr(account, "friendlyName"),
+        "email": _safe_getattr(account, "email"),
+    }
+
+
+def _letterboxd_movie_sections(server: PlexServer, library_name: Optional[str] = None) -> list:
+    sections = _find_sections(server, library_name) if library_name else _sections(server)
+    movie_sections = [section for section in sections if str(_safe_getattr(section, "type") or "").casefold() == "movie"]
+    if library_name and not movie_sections:
+        raise ValueError(f"'{library_name}' is not an exact Plex movie library name.")
+    return movie_sections
+
+
+def _letterboxd_ids(item) -> tuple[Optional[str], Optional[str]]:
+    tmdb_id = None
+    imdb_id = None
+    candidates = []
+    try:
+        candidates.extend(list(_safe_getattr(item, "guids", []) or []))
+    except Exception:
+        pass
+    primary = _safe_getattr(item, "guid")
+    if primary:
+        candidates.append(primary)
+    for value in candidates:
+        raw = str(_safe_getattr(value, "id", value) or "")
+        if raw.startswith("tmdb://") and tmdb_id is None:
+            tmdb_id = raw.split("tmdb://", 1)[1].split("?", 1)[0]
+        elif raw.startswith("imdb://") and imdb_id is None:
+            imdb_id = raw.split("imdb://", 1)[1].split("?", 1)[0]
+    return tmdb_id, imdb_id
+
+
+def _letterboxd_date(value) -> Optional[str]:
+    if not isinstance(value, datetime):
+        return None
+    try:
+        if value.tzinfo is not None:
+            value = value.astimezone()
+    except Exception:
+        pass
+    return value.date().isoformat()
+
+
+def _parse_ymd(value: Optional[str], field_name: str) -> Optional[str]:
+    if value is None or not str(value).strip():
+        return None
+    raw = str(value).strip()
+    try:
+        return datetime.strptime(raw, "%Y-%m-%d").date().isoformat()
+    except ValueError as exc:
+        raise ValueError(f"{field_name} must use YYYY-MM-DD format.") from exc
+
+
+def _safe_filename_component(value: str) -> str:
+    clean = re.sub(r'[<>:"/\\|?*]+', '-', str(value or '').strip())
+    clean = re.sub(r'\s+', '-', clean)
+    clean = re.sub(r'-{2,}', '-', clean).strip(' .-_')
+    return clean[:100] or "Letterboxd-Export"
+
+
+def _letterboxd_description(
+    mode: str,
+    description: Optional[str],
+    start_date: Optional[str],
+    end_date: Optional[str],
+    genre: Optional[str],
+    title_contains: Optional[str],
+    library_name: Optional[str],
+) -> str:
+    if description and str(description).strip():
+        return _safe_filename_component(description)
+    if mode == "full":
+        return "All-Watched-Movies"
+    if mode == "delta":
+        return "New-Watches-Since-Last-Export"
+    parts = []
+    if genre:
+        parts.append(f"{genre}-Movies")
+    if title_contains:
+        parts.append(f"Title-{title_contains}")
+    if start_date and end_date:
+        parts.append(f"{start_date}-to-{end_date}")
+    elif start_date:
+        parts.append(f"Since-{start_date}")
+    elif end_date:
+        parts.append(f"Through-{end_date}")
+    if library_name:
+        parts.append(library_name)
+    return _safe_filename_component('-'.join(parts) if parts else "Custom-Watched-Movies")
+
+
+def _letterboxd_writer(buffer):
+    return csv.DictWriter(
+        buffer,
+        fieldnames=LETTERBOXD_COLUMNS,
+        extrasaction="ignore",
+        lineterminator="\n",
+        quoting=csv.QUOTE_MINIMAL,
+        escapechar="\\",
+        doublequote=False,
+    )
+
+
+def _letterboxd_csv_bytes(rows: list[dict]) -> bytes:
+    buf = io.StringIO(newline='')
+    writer = _letterboxd_writer(buf)
+    writer.writeheader()
+    writer.writerows(rows)
+    return buf.getvalue().encode("utf-8")
+
+
+def _letterboxd_row_bytes(row: dict) -> bytes:
+    buf = io.StringIO(newline='')
+    writer = _letterboxd_writer(buf)
+    writer.writerow(row)
+    return buf.getvalue().encode("utf-8")
+
+
+def _write_letterboxd_parts(rows: list[dict], base_name: str) -> list[dict]:
+    export_dir = Path(LETTERBOXD_EXPORT_DIR)
+    export_dir.mkdir(parents=True, exist_ok=True)
+    header_size = len(_letterboxd_csv_bytes([]))
+    chunks = []
+    current = []
+    current_size = header_size
+    for row in rows:
+        row_size = len(_letterboxd_row_bytes(row))
+        if current and current_size + row_size > LETTERBOXD_MAX_FILE_BYTES:
+            chunks.append(current)
+            current = [row]
+            current_size = header_size + row_size
+        else:
+            current.append(row)
+            current_size += row_size
+    chunks.append(current)
+    created = []
+    total_parts = len(chunks)
+    try:
+        for index, chunk in enumerate(chunks, start=1):
+            suffix = f"_Part-{index:02d}-of-{total_parts:02d}" if total_parts > 1 else ""
+            path = export_dir / f"{base_name}{suffix}.csv"
+            payload = _letterboxd_csv_bytes(chunk)
+            path.write_bytes(payload)
+            created.append({"path": str(path), "filename": path.name, "rows": len(chunk), "size_bytes": len(payload)})
+    except Exception:
+        for entry in created:
+            try:
+                Path(entry["path"]).unlink(missing_ok=True)
+            except Exception:
+                pass
+        raise
+    return created
+
+
+def _letterboxd_state_path() -> Path:
+    return Path(LETTERBOXD_EXPORT_DIR) / "letterboxd-export-state.json"
+
+
+def _read_letterboxd_state() -> dict:
+    path = _letterboxd_state_path()
+    if not path.exists():
+        return {}
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+        return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
+
+def _write_letterboxd_state(data: dict) -> None:
+    path = _letterboxd_state_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temp = path.with_suffix('.tmp')
+    temp.write_text(json.dumps(data, indent=2, sort_keys=True), encoding="utf-8")
+    os.replace(temp, path)
+
+
+def _letterboxd_item_meta(server: PlexServer, rating_key: str, cache: dict[str, object]) -> object:
+    if rating_key not in cache:
+        item = server.fetchItem(int(rating_key))
+        try:
+            item.reload(includeGuids=True)
+        except Exception:
+            try:
+                item.reload()
+            except Exception:
+                pass
+        cache[rating_key] = item
+    return cache[rating_key]
+
+
+@mcp.tool(
+    description=(
+        "Generate a Letterboxd-compatible UTF-8 CSV from the configured Plex account only. mode must be full, delta, or custom. "
+        "Full exports all available Plex movie watch history plus watched-state movies lacking a history date. Delta exports watches since the last successful Full/Delta export. "
+        "Custom supports optional YYYY-MM-DD start/end dates, exact Plex movie library, genre, and title substring filters. "
+        "Files are timestamped and stored under the local Letterboxd-Exports folder. Custom exports never advance the Delta checkpoint. "
+        "The tool aborts if it cannot resolve the account associated with the configured Plex token, preventing accidental cross-user export."
+    ),
+    annotations=ToolAnnotations(read_only_hint=False, destructive_hint=False, idempotent_hint=False),
+)
+def letterboxd_export(
+    mode: str,
+    description: Optional[str] = None,
+    start_date: Optional[str] = None,
+    end_date: Optional[str] = None,
+    genre: Optional[str] = None,
+    title_contains: Optional[str] = None,
+    library_name: Optional[str] = None,
+) -> dict:
+    mode_key = str(mode or "").strip().casefold()
+    if mode_key not in {"full", "delta", "custom"}:
+        raise ValueError("mode must be one of: full, delta, custom")
+    start = _parse_ymd(start_date, "start_date")
+    end = _parse_ymd(end_date, "end_date")
+    if start and end and start > end:
+        raise ValueError("start_date cannot be after end_date.")
+    if mode_key == "custom" and not any([start, end, genre, title_contains, library_name]):
+        raise ValueError("Custom export requires at least one filter: start_date, end_date, genre, title_contains, or library_name.")
+
+    server = _plex()
+    account = _plex_token_account(server)
+    sections = _letterboxd_movie_sections(server, library_name)
+    state = _read_letterboxd_state()
+    delta_cutoff = None
+    if mode_key == "delta":
+        raw_cutoff = state.get("last_successful_full_or_delta_utc")
+        if not raw_cutoff:
+            raise ValueError("No prior successful Full/Delta Letterboxd export exists. Run a Full export first or use Custom with a start_date.")
+        try:
+            delta_cutoff = datetime.fromisoformat(str(raw_cutoff).replace("Z", "+00:00"))
+            if delta_cutoff.tzinfo is None:
+                delta_cutoff = delta_cutoff.replace(tzinfo=timezone.utc)
+        except Exception as exc:
+            raise RuntimeError("Stored Letterboxd delta checkpoint is invalid; run a Full export to establish a new checkpoint.") from exc
+
+    history_mindate = delta_cutoff - timedelta(seconds=2) if delta_cutoff is not None else None
+    events = []
+    cache: dict[str, object] = {}
+    for section in sections:
+        history = server.history(accountID=account["id"], librarySectionID=section.key, mindate=history_mindate)
+        for hist in history:
+            if str(_safe_getattr(hist, "type") or _safe_getattr(hist, "TYPE") or "").casefold() != "movie":
+                continue
+            viewed_at = _safe_getattr(hist, "viewedAt")
+            watched_date = _letterboxd_date(viewed_at)
+            if watched_date is None:
+                continue
+            if mode_key == "delta" and delta_cutoff is not None and isinstance(viewed_at, datetime):
+                compare_dt = viewed_at
+                if compare_dt.tzinfo is None:
+                    compare_dt = compare_dt.replace(tzinfo=timezone.utc)
+                if compare_dt <= delta_cutoff:
+                    continue
+            if start and watched_date < start:
+                continue
+            if end and watched_date > end:
+                continue
+            rating_key = str(_safe_getattr(hist, "ratingKey") or "")
+            if not rating_key:
+                continue
+            try:
+                item = _letterboxd_item_meta(server, rating_key, cache)
+            except Exception:
+                continue
+            if title_contains and str(_safe_getattr(item, "title") or "").casefold().find(str(title_contains).casefold()) < 0:
+                continue
+            if genre:
+                tags = [str(_safe_getattr(g, "tag") or "") for g in (_safe_getattr(item, "genres", []) or [])]
+                if not any(str(genre).casefold() in tag.casefold() for tag in tags):
+                    continue
+            events.append({"rating_key": rating_key, "viewed_at": viewed_at, "watched_date": watched_date, "item": item})
+
+    # Oldest-first produces correct rewatch ordering. Same-film/same-date duplicates are
+    # collapsed because Letterboxd itself cannot preserve multiple diary entries for the
+    # same film on the same date during CSV import.
+    def _history_sort_key(row):
+        value = row.get("viewed_at")
+        if isinstance(value, datetime):
+            try:
+                return value.timestamp()
+            except Exception:
+                pass
+        return 0.0
+
+    events.sort(key=_history_sort_key)
+    unique_events = []
+    seen_day_keys = set()
+    for event in events:
+        day_key = (event["rating_key"], event["watched_date"])
+        if day_key in seen_day_keys:
+            continue
+        seen_day_keys.add(day_key)
+        unique_events.append(event)
+
+    selected_counts: dict[str, int] = {}
+    for event in unique_events:
+        selected_counts[event["rating_key"]] = selected_counts.get(event["rating_key"], 0) + 1
+    emitted_counts: dict[str, int] = {}
+    rows = []
+    history_rating_keys = set()
+    for event in unique_events:
+        item = event["item"]
+        rating_key = event["rating_key"]
+        history_rating_keys.add(rating_key)
+        tmdb_id, imdb_id = _letterboxd_ids(item)
+        total_views = int(_safe_getattr(item, "viewCount", 0) or 0)
+        selected_total = selected_counts.get(rating_key, 1)
+        prior_views = max(0, total_views - selected_total)
+        ordinal = emitted_counts.get(rating_key, 0)
+        emitted_counts[rating_key] = ordinal + 1
+        rating = _safe_getattr(item, "userRating")
+        try:
+            rating10 = max(1, min(10, int(round(float(rating))))) if rating is not None and float(rating) > 0 else ""
+        except Exception:
+            rating10 = ""
+        rows.append({
+            "tmdbID": tmdb_id or "",
+            "imdbID": imdb_id or "",
+            "Title": _safe_getattr(item, "title") or "",
+            "Year": _safe_getattr(item, "year") or "",
+            "Rating10": rating10,
+            "WatchedDate": event["watched_date"],
+            "Rewatch": "true" if (prior_views + ordinal) > 0 else "false",
+        })
+
+    # Full mode also captures items Plex currently marks watched even if there is no
+    # corresponding dated history event. These are imported as watched without inventing a date.
+    undated_watched_count = 0
+    if mode_key == "full":
+        for section in sections:
+            for movie in section.all():
+                rating_key = str(_safe_getattr(movie, "ratingKey") or "")
+                if not rating_key or rating_key in history_rating_keys:
+                    continue
+                if int(_safe_getattr(movie, "viewCount", 0) or 0) <= 0:
+                    continue
+                try:
+                    item = _letterboxd_item_meta(server, rating_key, cache)
+                except Exception:
+                    item = movie
+                tmdb_id, imdb_id = _letterboxd_ids(item)
+                rating = _safe_getattr(item, "userRating")
+                try:
+                    rating10 = max(1, min(10, int(round(float(rating))))) if rating is not None and float(rating) > 0 else ""
+                except Exception:
+                    rating10 = ""
+                rows.append({
+                    "tmdbID": tmdb_id or "",
+                    "imdbID": imdb_id or "",
+                    "Title": _safe_getattr(item, "title") or "",
+                    "Year": _safe_getattr(item, "year") or "",
+                    "Rating10": rating10,
+                    "WatchedDate": "",
+                    "Rewatch": "",
+                })
+                undated_watched_count += 1
+
+    generated_at = datetime.now(timezone.utc)
+    file_stamp = datetime.now().strftime("%Y-%m-%d_%H%M%S")
+    desc = _letterboxd_description(mode_key, description, start, end, genre, title_contains, library_name)
+    type_name = mode_key.title()
+    base_name = f"{file_stamp}_{desc}_{type_name}"
+    files = _write_letterboxd_parts(rows, base_name)
+
+    if mode_key in {"full", "delta"}:
+        _write_letterboxd_state({
+            "version": 1,
+            "last_successful_full_or_delta_utc": generated_at.isoformat().replace("+00:00", "Z"),
+            "last_mode": mode_key,
+            "last_row_count": len(rows),
+            "last_files": [entry["filename"] for entry in files],
+        })
+
+    return {
+        "mode": mode_key,
+        "plex_account_id": account["id"],
+        "plex_account": account.get("username") or account.get("friendly_name"),
+        "source": "Plex",
+        "other_plex_users_included": False,
+        "row_count": len(rows),
+        "dated_history_rows": len(unique_events),
+        "undated_watched_rows": undated_watched_count,
+        "files": files,
+        "delta_checkpoint_advanced": mode_key in {"full", "delta"},
+        "delta_previous_checkpoint": state.get("last_successful_full_or_delta_utc") if mode_key == "delta" else None,
+        "columns": LETTERBOXD_COLUMNS,
+        "letterboxd_size_limit_protection": True,
+    }
+
+
+# ===========================================================================
 # Tautulli-backed reporting subsystem
 # ===========================================================================
 
@@ -3262,7 +4134,7 @@ def _tautulli_endpoint(cmd: str, params: Optional[dict] = None) -> str:
 
 def _tautulli_api(cmd: str, params: Optional[dict] = None, timeout: int = 60):
     url = _tautulli_endpoint(cmd, params)
-    request = Request(url, headers={"User-Agent": "MediaStack-Control-Gateway/3.4.6"})
+    request = Request(url, headers={"User-Agent": "MediaStack-Control-Gateway/3.5.3"})
     try:
         with urlopen(request, timeout=timeout) as response:
             raw = response.read()
@@ -3876,7 +4748,7 @@ def plex_reporting_export_status(library_name: str, export_id: int) -> dict:
 def _download_export_to_local_cache(export_id: int) -> dict:
     export_id = int(export_id)
     url = _tautulli_endpoint("download_export", {"export_id": export_id})
-    request = Request(url, headers={"User-Agent": "MediaStack-Control-Gateway/3.4.6"})
+    request = Request(url, headers={"User-Agent": "MediaStack-Control-Gateway/3.5.3"})
     try:
         with urlopen(request, timeout=300) as response:
             raw = response.read()
@@ -4131,7 +5003,7 @@ def _arr_api(
     headers = {
         "X-Api-Key": cfg["api_key"],
         "Accept": "application/json",
-        "User-Agent": "MediaStack-Control-Gateway-Arr/3.4.5",
+        "User-Agent": "MediaStack-Control-Gateway-Arr/3.5.3",
     }
     if body is not None:
         data = json.dumps(body).encode("utf-8")
@@ -4314,6 +5186,53 @@ def _arr_all_items(app: str) -> list[dict]:
     endpoint = {"radarr": "movie", "sonarr": "series", "lidarr": "artist"}[app]
     data = _arr_api(app, "GET", endpoint, timeout=120)
     return data if isinstance(data, list) else []
+
+
+def _arr_find_existing_by_external_id(app: str, external_id) -> Optional[dict]:
+    """Find an already-managed Arr item by its stable external provider ID."""
+    name = str(app).casefold()
+    field = {"radarr": "tmdbId", "sonarr": "tvdbId", "lidarr": "foreignArtistId"}[name]
+    wanted = str(external_id).strip().casefold()
+    for item in _arr_all_items(name):
+        value = item.get(field)
+        if value is not None and str(value).strip().casefold() == wanted:
+            return item
+        # Lidarr versions/plugins can sometimes expose mbId instead.
+        if name == "lidarr":
+            mb_value = item.get("mbId")
+            if mb_value is not None and str(mb_value).strip().casefold() == wanted:
+                return item
+    return None
+
+
+def _arr_add_error_result(app: str, external_id, exc: Exception) -> dict:
+    message = str(exc)
+    lowered = message.casefold()
+    reason = "timeout" if "timed out" in lowered or "timeout" in lowered else "api_error"
+
+    # A POST can complete in Arr even when the caller times out waiting for the
+    # response. Re-query the local library before declaring failure.
+    try:
+        existing = _arr_find_existing_by_external_id(app, external_id)
+    except Exception:
+        existing = None
+    if isinstance(existing, dict):
+        return {
+            "added": True,
+            "already_exists": False,
+            "verified_after_error": True,
+            "request_error": message,
+            **_arr_item_label(app, existing),
+        }
+
+    return {
+        "added": False,
+        "already_exists": False,
+        "reason": reason,
+        "message": message,
+        "app": app,
+        "external_id": str(external_id),
+    }
 
 
 def _arr_file_owner_id(app: str, file_row: dict) -> Optional[int]:
@@ -4605,8 +5524,179 @@ def arr_history(app: str, page: int = 1, page_size: int = 100, event_type: Optio
 def arr_command_status(app: str, command_id: int) -> dict:
     name = str(app).casefold()
     _arr_cfg(name)
-    data = _arr_api(name, "GET", f"command/{int(command_id)}")
-    return data if isinstance(data, dict) else {"result": data}
+    try:
+        data = _arr_api(name, "GET", f"command/{int(command_id)}")
+    except RuntimeError as exc:
+        message = str(exc)
+        if "HTTP 404" in message:
+            return {
+                "found": False,
+                "reason": "not_found",
+                "app": name,
+                "command_id": int(command_id),
+                "message": message,
+            }
+        return {
+            "found": False,
+            "reason": "api_error",
+            "app": name,
+            "command_id": int(command_id),
+            "message": message,
+        }
+    return {"found": True, **data} if isinstance(data, dict) else {"found": True, "result": data}
+
+
+def _arr_wanted_row(app: str, row: dict) -> dict:
+    if app == "sonarr":
+        series = row.get("series") or {}
+        return {
+            "id": row.get("id"),
+            "series_id": row.get("seriesId"),
+            "series": series.get("title") if isinstance(series, dict) else None,
+            "season_number": row.get("seasonNumber"),
+            "episode_number": row.get("episodeNumber"),
+            "title": row.get("title"),
+            "air_date": row.get("airDate"),
+            "air_date_utc": row.get("airDateUtc"),
+            "monitored": row.get("monitored"),
+            "has_file": row.get("hasFile"),
+        }
+    if app == "radarr":
+        return {
+            "id": row.get("id"),
+            "title": row.get("title"),
+            "year": row.get("year"),
+            "tmdb_id": row.get("tmdbId"),
+            "monitored": row.get("monitored"),
+            "has_file": row.get("hasFile"),
+            "status": row.get("status"),
+            "in_cinemas": row.get("inCinemas"),
+            "digital_release": row.get("digitalRelease"),
+            "physical_release": row.get("physicalRelease"),
+        }
+    artist = row.get("artist") or {}
+    return {
+        "id": row.get("id"),
+        "title": row.get("title"),
+        "artist_id": row.get("artistId"),
+        "artist": artist.get("artistName") if isinstance(artist, dict) else None,
+        "foreign_album_id": row.get("foreignAlbumId"),
+        "release_date": row.get("releaseDate"),
+        "monitored": row.get("monitored"),
+        "any_release_ok": row.get("anyReleaseOk"),
+    }
+
+
+@mcp.tool(
+    description=(
+        "Return monitored wanted/missing items from Sonarr, Radarr, or Lidarr using each app's native wanted/missing endpoint. "
+        "Sonarr returns missing episodes, Radarr missing movies, and Lidarr missing albums. Read-only. Maximum 500 rows per call."
+    ),
+    annotations=ToolAnnotations(read_only_hint=True, idempotent_hint=True),
+)
+def arr_wanted(app: str, page: int = 1, page_size: int = 100) -> dict:
+    name = str(app or "").strip().casefold()
+    _arr_cfg(name)
+    page_value = max(1, int(page))
+    size_value = max(1, min(int(page_size), 500))
+    params = {
+        "page": page_value,
+        "pageSize": size_value,
+        "monitored": "true",
+    }
+    if name == "sonarr":
+        params["includeSeries"] = "true"
+        params["includeImages"] = "false"
+    elif name == "lidarr":
+        params["includeArtist"] = "true"
+    data = _arr_api(name, "GET", "wanted/missing", params=params, timeout=60)
+    if isinstance(data, dict):
+        records = data.get("records") or []
+        return {
+            "app": name,
+            "page": data.get("page", page_value),
+            "page_size": data.get("pageSize", size_value),
+            "total_records": data.get("totalRecords", len(records)),
+            "records": [_arr_wanted_row(name, row) for row in records if isinstance(row, dict)],
+        }
+    records = data if isinstance(data, list) else []
+    return {"app": name, "page": page_value, "page_size": size_value, "total_records": len(records), "records": [_arr_wanted_row(name, row) for row in records if isinstance(row, dict)]}
+
+
+def _calendar_date(value: Optional[str], field_name: str, default: datetime) -> str:
+    if value is None or not str(value).strip():
+        return default.strftime("%Y-%m-%d")
+    raw = str(value).strip()
+    try:
+        return datetime.strptime(raw, "%Y-%m-%d").strftime("%Y-%m-%d")
+    except ValueError as exc:
+        raise ValueError(f"{field_name} must use YYYY-MM-DD format.") from exc
+
+
+def _arr_calendar_row(app: str, row: dict) -> dict:
+    if app == "sonarr":
+        series = row.get("series") or {}
+        return {
+            "id": row.get("id"),
+            "series_id": row.get("seriesId"),
+            "series": series.get("title") if isinstance(series, dict) else None,
+            "season_number": row.get("seasonNumber"),
+            "episode_number": row.get("episodeNumber"),
+            "title": row.get("title"),
+            "air_date": row.get("airDate"),
+            "air_date_utc": row.get("airDateUtc"),
+            "monitored": row.get("monitored"),
+            "has_file": row.get("hasFile"),
+        }
+    if app == "radarr":
+        return {
+            "id": row.get("id"),
+            "title": row.get("title"),
+            "year": row.get("year"),
+            "tmdb_id": row.get("tmdbId"),
+            "monitored": row.get("monitored"),
+            "has_file": row.get("hasFile"),
+            "in_cinemas": row.get("inCinemas"),
+            "digital_release": row.get("digitalRelease"),
+            "physical_release": row.get("physicalRelease"),
+        }
+    artist = row.get("artist") or {}
+    return {
+        "id": row.get("id"),
+        "title": row.get("title"),
+        "artist_id": row.get("artistId"),
+        "artist": artist.get("artistName") if isinstance(artist, dict) else None,
+        "foreign_album_id": row.get("foreignAlbumId"),
+        "release_date": row.get("releaseDate"),
+        "monitored": row.get("monitored"),
+    }
+
+
+@mcp.tool(
+    description=(
+        "Return upcoming monitored entries from the native Sonarr, Radarr, or Lidarr calendar. "
+        "Dates use YYYY-MM-DD. If omitted, the range is today through seven days from today. Read-only."
+    ),
+    annotations=ToolAnnotations(read_only_hint=True, idempotent_hint=True),
+)
+def arr_calendar(app: str, start_date: Optional[str] = None, end_date: Optional[str] = None, max_results: int = 500) -> dict:
+    name = str(app or "").strip().casefold()
+    _arr_cfg(name)
+    now = datetime.now()
+    start = _calendar_date(start_date, "start_date", now)
+    end = _calendar_date(end_date, "end_date", now + timedelta(days=7))
+    if start > end:
+        raise ValueError("start_date cannot be after end_date.")
+    params = {"start": start, "end": end}
+    if name == "sonarr":
+        params.update({"includeSeries": "true", "includeEpisodeFile": "true", "unmonitored": "false"})
+    data = _arr_api(name, "GET", "calendar", params=params, timeout=60)
+    rows = data if isinstance(data, list) else []
+    # Defensive local monitoring filter for apps that include unmonitored records.
+    rows = [row for row in rows if isinstance(row, dict) and row.get("monitored") is not False]
+    limit = max(1, min(int(max_results), 5000))
+    compact = [_arr_calendar_row(name, row) for row in rows[:limit]]
+    return {"app": name, "start_date": start, "end_date": end, "total_returned_by_app": len(rows), "returned": len(compact), "truncated": len(rows) > limit, "entries": compact}
 
 
 @mcp.tool(
@@ -4689,9 +5779,19 @@ def radarr_add_movie(
     minimum_availability: str = "released",
     tags: Optional[list[int]] = None,
 ) -> dict:
+    existing = _arr_find_existing_by_external_id("radarr", int(tmdb_id))
+    if isinstance(existing, dict):
+        return {"added": False, "already_exists": True, **_arr_item_label("radarr", existing)}
+
     lookup = _arr_api("radarr", "GET", "movie/lookup/tmdb", params={"tmdbId": int(tmdb_id)}, timeout=60)
     if not isinstance(lookup, dict):
-        raise ValueError(f"Radarr could not resolve TMDB ID {tmdb_id}.")
+        return {
+            "added": False,
+            "already_exists": False,
+            "reason": "lookup_failed",
+            "message": f"Radarr could not resolve TMDB ID {tmdb_id}.",
+            "tmdb_id": int(tmdb_id),
+        }
     payload = {
         "title": lookup.get("title"),
         "year": lookup.get("year"),
@@ -4705,8 +5805,11 @@ def radarr_add_movie(
         "tags": [int(x) for x in (tags or [])],
         "addOptions": {"searchForMovie": bool(search_on_add)},
     }
-    result = _arr_api("radarr", "POST", "movie", body=payload, timeout=60)
-    return _arr_item_label("radarr", result if isinstance(result, dict) else payload)
+    try:
+        result = _arr_api("radarr", "POST", "movie", body=payload, timeout=60)
+    except Exception as exc:
+        return _arr_add_error_result("radarr", int(tmdb_id), exc)
+    return {"added": True, "already_exists": False, **_arr_item_label("radarr", result if isinstance(result, dict) else payload)}
 
 
 @mcp.tool(
@@ -4873,10 +5976,20 @@ def sonarr_add_series(
     series_type: str = "standard",
     tags: Optional[list[int]] = None,
 ) -> dict:
+    existing = _arr_find_existing_by_external_id("sonarr", int(tvdb_id))
+    if isinstance(existing, dict):
+        return {"added": False, "already_exists": True, **_arr_item_label("sonarr", existing)}
+
     candidates = _arr_api("sonarr", "GET", "series/lookup", params={"term": f"tvdb:{int(tvdb_id)}"}, timeout=60) or []
     lookup = next((x for x in candidates if int(x.get("tvdbId") or 0) == int(tvdb_id)), None)
     if not isinstance(lookup, dict):
-        raise ValueError(f"Sonarr could not resolve TVDB ID {tvdb_id}.")
+        return {
+            "added": False,
+            "already_exists": False,
+            "reason": "lookup_failed",
+            "message": f"Sonarr could not resolve TVDB ID {tvdb_id}.",
+            "tvdb_id": int(tvdb_id),
+        }
     payload = {
         "title": lookup.get("title"), "year": lookup.get("year"), "tvdbId": int(tvdb_id),
         "titleSlug": lookup.get("titleSlug"), "images": lookup.get("images") or [],
@@ -4885,8 +5998,11 @@ def sonarr_add_series(
         "tags": [int(x) for x in (tags or [])],
         "addOptions": {"monitor": monitor, "searchForMissingEpisodes": bool(search_on_add), "searchForCutoffUnmetEpisodes": False},
     }
-    result = _arr_api("sonarr", "POST", "series", body=payload, timeout=60)
-    return _arr_item_label("sonarr", result if isinstance(result, dict) else payload)
+    try:
+        result = _arr_api("sonarr", "POST", "series", body=payload, timeout=60)
+    except Exception as exc:
+        return _arr_add_error_result("sonarr", int(tvdb_id), exc)
+    return {"added": True, "already_exists": False, **_arr_item_label("sonarr", result if isinstance(result, dict) else payload)}
 
 
 @mcp.tool(
@@ -5041,21 +6157,36 @@ def lidarr_add_artist(
     monitor: str = "all",
     tags: Optional[list[int]] = None,
 ) -> dict:
-    candidates = _arr_api("lidarr", "GET", "artist/lookup", params={"term": f"lidarr:{foreign_artist_id}"}, timeout=60) or []
-    lookup = next((x for x in candidates if str(x.get("foreignArtistId") or x.get("mbId") or "").casefold() == str(foreign_artist_id).casefold()), None)
+    external_id = str(foreign_artist_id).strip()
+    existing = _arr_find_existing_by_external_id("lidarr", external_id)
+    if isinstance(existing, dict):
+        return {"added": False, "already_exists": True, **_arr_item_label("lidarr", existing)}
+
+    candidates = _arr_api("lidarr", "GET", "artist/lookup", params={"term": f"lidarr:{external_id}"}, timeout=60) or []
+    lookup = next((x for x in candidates if str(x.get("foreignArtistId") or x.get("mbId") or "").casefold() == external_id.casefold()), None)
     if lookup is None:
-        candidates = _arr_api("lidarr", "GET", "artist/lookup", params={"term": foreign_artist_id}, timeout=60) or []
-        lookup = next((x for x in candidates if str(x.get("foreignArtistId") or x.get("mbId") or "").casefold() == str(foreign_artist_id).casefold()), None)
-    if not isinstance(lookup, dict): raise ValueError(f"Lidarr could not resolve artist ID {foreign_artist_id}.")
+        candidates = _arr_api("lidarr", "GET", "artist/lookup", params={"term": external_id}, timeout=60) or []
+        lookup = next((x for x in candidates if str(x.get("foreignArtistId") or x.get("mbId") or "").casefold() == external_id.casefold()), None)
+    if not isinstance(lookup, dict):
+        return {
+            "added": False,
+            "already_exists": False,
+            "reason": "lookup_failed",
+            "message": f"Lidarr could not resolve artist ID {external_id}.",
+            "foreign_artist_id": external_id,
+        }
     payload = {
-        "artistName": lookup.get("artistName"), "foreignArtistId": lookup.get("foreignArtistId") or foreign_artist_id,
+        "artistName": lookup.get("artistName"), "foreignArtistId": lookup.get("foreignArtistId") or external_id,
         "qualityProfileId": int(quality_profile_id), "metadataProfileId": int(metadata_profile_id),
         "rootFolderPath": str(root_folder_path), "monitored": bool(monitored), "monitorNewItems": "all",
         "tags": [int(x) for x in (tags or [])],
         "addOptions": {"monitor": monitor, "searchForMissingAlbums": bool(search_on_add)},
     }
-    result = _arr_api("lidarr", "POST", "artist", body=payload, timeout=60)
-    return _arr_item_label("lidarr", result if isinstance(result, dict) else payload)
+    try:
+        result = _arr_api("lidarr", "POST", "artist", body=payload, timeout=60)
+    except Exception as exc:
+        return _arr_add_error_result("lidarr", external_id, exc)
+    return {"added": True, "already_exists": False, **_arr_item_label("lidarr", result if isinstance(result, dict) else payload)}
 
 
 @mcp.tool(
@@ -5298,17 +6429,53 @@ $pythonServer = $pythonServer.Replace('__RADARR_API_KEY__', $RadarrApiKey.Replac
 $pythonServer = $pythonServer.Replace('__LIDARR_URL__', $LidarrUrl.Replace('\', '\\').Replace('"', '\"'))
 $pythonServer = $pythonServer.Replace('__LIDARR_API_KEY__', $LidarrApiKey.Replace('\', '\\').Replace('"', '\"'))
 $pythonServer = $pythonServer.Replace('__REPORT_EXPORT_DIR__', $ReportingExportDir.Replace('\', '\\').Replace('"', '\"'))
+$pythonServer = $pythonServer.Replace('__LETTERBOXD_EXPORT_DIR__', $LetterboxdExportDir.Replace('\', '\\').Replace('"', '\"'))
 $pythonServer = $pythonServer.Replace('__TUNNEL_RUNTIME_LOG__', (Join-Path $LogDir 'tunnel-runtime.log').Replace('\', '\\').Replace('"', '\"'))
 $pythonServer = $pythonServer.Replace('__TUNNEL_HEALTH_URL_FILE__', $HealthUrlFile.Replace('\', '\\').Replace('"', '\"'))
 
 $McpServerChanged = Set-ContentIfChanged -Path $McpServer -Content $pythonServer
 Set-SecureAcl -Path $McpServer
 
+# Validate the exact generated file before any tunnel process is allowed to use it.
+$writtenMcp = Get-Content -LiteralPath $McpServer -Raw -ErrorAction Stop
+$generatedToolCount = ([regex]::Matches($writtenMcp, '(?m)^@mcp\.tool\(')).Count
+if ($generatedToolCount -ne $ExpectedMcpToolCount) {
+    throw "Generated MCP schema validation failed. Expected $ExpectedMcpToolCount tools but found $generatedToolCount in $McpServer."
+}
+
+foreach ($requiredTool in $RequiredMcpTools) {
+    $requiredPattern = '(?m)^def\s+' + [regex]::Escape($requiredTool) + '\s*\('
+    if (-not [regex]::IsMatch($writtenMcp, $requiredPattern)) {
+        throw "Generated MCP schema validation failed. Required tool '$requiredTool' is missing from $McpServer."
+    }
+}
+
+$compileResult = Invoke-NativeCaptured `
+    -FilePath $PythonExe `
+    -ArgumentList @('-m', 'py_compile', $McpServer) `
+    -Label 'mcp-python-compile'
+if ($compileResult.ExitCode -ne 0) {
+    throw "Generated MCP Python failed compilation.`r`nSTDOUT:`r`n$($compileResult.StdOut)`r`nSTDERR:`r`n$($compileResult.StdErr)"
+}
+
+$mcpHash = (Get-FileHash -Algorithm SHA256 -LiteralPath $McpServer).Hash.ToLowerInvariant()
+$schemaState = [ordered]@{
+    gateway_version = $GatewayVersion
+    expected_tool_count = $ExpectedMcpToolCount
+    generated_tool_count = $generatedToolCount
+    sha256 = $mcpHash
+    generated_at = (Get-Date).ToString('o')
+    forced_runtime_reload = [bool]$ForceSchemaReload
+}
+[System.IO.File]::WriteAllText($SchemaStateFile, ($schemaState | ConvertTo-Json -Depth 4), (New-Object System.Text.UTF8Encoding($false)))
+Set-SecureAcl -Path $SchemaStateFile
+Write-Good "Generated MCP schema verified: $generatedToolCount tools; Python compilation passed."
+
 if ($McpServerChanged) {
     Write-Fix 'MCP server definition changed. The tunnel runtime will be restarted so ChatGPT can discover the new tool schema.'
 }
 else {
-    Write-Skip 'MCP server definition is unchanged.'
+    Write-Skip 'MCP server definition is unchanged, but v3.5.3 will still force a clean runtime restart to prevent a stale resident schema.'
 }
 
 # ===========================================================================
@@ -5317,7 +6484,7 @@ else {
 Show-Stage 6 'Validate Plex, Tautulli, Sonarr, Radarr, and Lidarr connections'
 
 Write-Host "Testing Plex at $PlexUrl..."
-$plexCode = "import importlib.util; s=importlib.util.spec_from_file_location('media_stack_gateway', r'$McpServer'); m=importlib.util.module_from_spec(s); s.loader.exec_module(m); p=m._plex(); print(p.friendlyName)"
+$plexCode = "import importlib.util; s=importlib.util.spec_from_file_location('plex_mcp', r'$McpServer'); m=importlib.util.module_from_spec(s); s.loader.exec_module(m); p=m._plex(); print(p.friendlyName)"
 $plexResult = Invoke-NativeCaptured `
     -FilePath $PythonExe `
     -ArgumentList @('-c', $plexCode) `
@@ -5331,7 +6498,7 @@ $plexName = $plexResult.StdOut.Trim()
 Write-Skip "Plex connection works. Server: $plexName"
 
 Write-Host "Testing Tautulli reporting API at $TautulliUrl..."
-$tautulliCode = "import importlib.util, json; s=importlib.util.spec_from_file_location('media_stack_gateway', r'$McpServer'); m=importlib.util.module_from_spec(s); s.loader.exec_module(m); print(json.dumps(m.plex_reporting_status()))"
+$tautulliCode = "import importlib.util, json; s=importlib.util.spec_from_file_location('plex_mcp', r'$McpServer'); m=importlib.util.module_from_spec(s); s.loader.exec_module(m); print(json.dumps(m.plex_reporting_status()))"
 $tautulliResult = Invoke-NativeCaptured `
     -FilePath $PythonExe `
     -ArgumentList @('-c', $tautulliCode) `
@@ -5364,7 +6531,7 @@ else {
 
 $arrAvailability = @{ sonarr = $false; radarr = $false; lidarr = $false }
 Write-Host "Testing Sonarr, Radarr, and Lidarr APIs..."
-$arrCode = "import importlib.util, json; s=importlib.util.spec_from_file_location('media_stack_gateway', r'$McpServer'); m=importlib.util.module_from_spec(s); s.loader.exec_module(m); print(json.dumps(m.arr_status()))"
+$arrCode = "import importlib.util, json; s=importlib.util.spec_from_file_location('plex_mcp', r'$McpServer'); m=importlib.util.module_from_spec(s); s.loader.exec_module(m); print(json.dumps(m.arr_status()))"
 $arrResult = Invoke-NativeCaptured `
     -FilePath $PythonExe `
     -ArgumentList @('-c', $arrCode) `
@@ -5430,7 +6597,7 @@ else {
 # ===========================================================================
 Show-Stage 7 'Validate MCP server and launch command'
 
-$importCode = "import importlib.util; s=importlib.util.spec_from_file_location('media_stack_gateway', r'$McpServer'); m=importlib.util.module_from_spec(s); s.loader.exec_module(m); print('MCP server imports successfully')"
+$importCode = "import importlib.util; s=importlib.util.spec_from_file_location('plex_mcp', r'$McpServer'); m=importlib.util.module_from_spec(s); s.loader.exec_module(m); print('MCP server imports successfully')"
 $importResult = Invoke-NativeCaptured `
     -FilePath $PythonExe `
     -ArgumentList @('-c', $importCode) `
@@ -5531,7 +6698,7 @@ $existingTaskAtStage8 = Get-ScheduledTask -TaskName $TaskName -ErrorAction Silen
 $runtimeAlreadyHealthy = ($existingTaskAtStage8 -and $existingTaskAtStage8.State -eq 'Running' -and (Test-TunnelHealth))
 $runtimeAlreadyReady = ($runtimeAlreadyHealthy -and (Test-TunnelReady))
 
-if ((-not $profileChanged) -and (-not $McpServerChanged) -and $runtimeAlreadyHealthy) {
+if ((-not $ForceSchemaReload) -and (-not $profileChanged) -and (-not $McpServerChanged) -and $runtimeAlreadyHealthy) {
     if ($runtimeAlreadyReady) {
         Write-Skip 'Existing tunnel runtime is healthy and ready; profile and MCP code are unchanged. Skipping doctor.'
     }
@@ -5547,10 +6714,17 @@ else {
         elseif ($profileChanged) {
             Write-Fix 'Stopping existing tunnel because the tunnel profile changed.'
         }
+        elseif ($ForceSchemaReload) {
+            Write-Fix 'Stopping existing tunnel for a forced clean MCP schema reload.'
+        }
         else {
             Write-Fix 'Stopping existing tunnel because liveness validation failed.'
         }
         Stop-TunnelTaskIfRunning
+    }
+
+    if ($ForceSchemaReload -or $McpServerChanged -or $profileChanged) {
+        Stop-ManagedTunnelProcesses
     }
 
     Remove-Item -LiteralPath $HealthUrlFile -Force -Confirm:$false -ErrorAction SilentlyContinue
@@ -6011,7 +7185,7 @@ if ($taskNeedsUpdate) {
         -Trigger $trigger `
         -Settings $settings `
         -Principal $principal `
-        -Description 'Self-healing OpenAI secure tunnel for the local MediaStack Control Gateway MCP server.' `
+        -Description 'Self-healing OpenAI secure tunnel for the local Plex MCP server.' `
         -Force | Out-Null
 
     Write-Good 'Primary tunnel scheduled task created/updated.'
@@ -6057,7 +7231,7 @@ if ($watchdogNeedsUpdate) {
         -Trigger $watchdogTrigger `
         -Settings $watchdogSettings `
         -Principal $watchdogPrincipal `
-        -Description 'Checks MediaStack Control Gateway tunnel health every minute and performs bounded recovery when necessary.' `
+        -Description 'Checks the MediaStack Control Gateway tunnel every minute and restarts it if unhealthy.' `
         -Force | Out-Null
 
     Write-Good 'Tunnel watchdog scheduled task created/updated.'
@@ -6070,7 +7244,7 @@ Show-Stage 11 'Start or reuse tunnel runtime'
 
 $task = Get-ScheduledTask -TaskName $TaskName
 $runtimeHealthyNow = ($task.State -eq 'Running' -and (Test-TunnelHealth))
-$runtimeNeedsReload = ($McpServerChanged -or $profileChanged -or $TunnelRunnerChanged)
+$runtimeNeedsReload = ($ForceSchemaReload -or $McpServerChanged -or $profileChanged -or $TunnelRunnerChanged)
 
 if ($runtimeHealthyNow -and (-not $runtimeNeedsReload)) {
     Write-Skip 'Tunnel scheduled task is running and /healthz reports healthy; runtime code/profile are unchanged.'
@@ -6094,6 +7268,9 @@ else {
         elseif ($TunnelRunnerChanged) {
             Write-Fix 'Tunnel supervisor changed. Restarting the runtime to load the new supervisor/log-rotation behavior.'
         }
+        elseif ($ForceSchemaReload) {
+            Write-Fix 'Forcing a clean tunnel restart so only the verified v3.5.3 MCP schema remains resident.'
+        }
         else {
             Write-Fix 'Tunnel task is running but /healthz liveness failed. Restarting it.'
         }
@@ -6102,6 +7279,8 @@ else {
     else {
         Write-Fix "Tunnel task state is '$($task.State)'. Starting it."
     }
+
+    Stop-ManagedTunnelProcesses
 
     Remove-Item -LiteralPath $HealthUrlFile -Force -Confirm:$false -ErrorAction SilentlyContinue
     Remove-Item -LiteralPath $LegacyHealthUrlFile -Force -Confirm:$false -ErrorAction SilentlyContinue
@@ -6185,6 +7364,7 @@ Write-Host "Radarr available  : $($arrAvailability['radarr'])"
 Write-Host "Lidarr API        : $LidarrUrl"
 Write-Host "Lidarr available  : $($arrAvailability['lidarr'])"
 Write-Host "Reporting exports : $ReportingExportDir"
+Write-Host "Letterboxd exports: $LetterboxdExportDir"
 Write-Host "Tunnel ID         : $TunnelId"
 Write-Host "Install root      : $Root"
 Write-Host "Portable Python   : $PythonExe"
@@ -6205,7 +7385,7 @@ Write-Host "Local admin UI    : $healthBaseUrl/ui"
 Write-Host ""
 Write-Host "This installer is now safe to run again." -ForegroundColor Green
 Write-Host "Working stages will report SKIP; only missing/broken stages will be repaired." -ForegroundColor Green
-Write-Host "SELF-HEALING ENABLED: tunnel-client restarts automatically after exit; watchdog uses /healthz liveness plus bounded /readyz recovery ($WatchdogReadinessFailureThreshold failures, $WatchdogReadinessRestartCooldownMinutes-minute readiness restart cooldown)." -ForegroundColor Green
+Write-Host "SELF-HEALING ENABLED: tunnel-client restarts automatically after exit; watchdog uses /healthz liveness plus bounded /readyz recovery (3 failures, 10-minute readiness restart cooldown)." -ForegroundColor Green
 Write-Host "COLLECTION METADATA ENABLED: read/update summaries, sort/display settings, labels, visibility, posters, and background art." -ForegroundColor Green
 Write-Host "ITEM SUMMARY METADATA ENABLED: read/update movie and TV show summaries by exact Plex rating key; edits are locked and preserve all other metadata." -ForegroundColor Green
 Write-Host "ITEM POSTER METADATA ENABLED: replace individual movie and TV show posters by exact Plex rating key from URL or local image; selected posters are locked." -ForegroundColor Green
@@ -6213,20 +7393,20 @@ Write-Host "ADDED AT METADATA ENABLED: read/update movie, show, season, and epis
 Write-Host "HUB CACHE REFRESH ENABLED: non-destructively refresh/warm a library's transient Plex hubs and verify current Recently Added ordering." -ForegroundColor Green
 Write-Host "INSTALLER LOGGING ENABLED: full timestamped installer transcripts are stored under $LogDir." -ForegroundColor Green
 Write-Host "TUNNEL DIAGNOSTICS ENABLED: read-only timing and runtime-log diagnostics can measure response deadlines, TTL events, restarts, and transport failures." -ForegroundColor Green
-Write-Host "BOUNDED LOGGING ENABLED: runtime log rotates at $([math]::Round($RuntimeLogMaxBytes / 1MB)) MB with $RuntimeLogRetainedFiles retained files; watchdog log rotates at $([math]::Round($WatchdogLogMaxBytes / 1MB)) MB with $WatchdogLogRetainedFiles retained files; $InstallerLogRetainCount installer transcripts retained." -ForegroundColor Green
+Write-Host "BOUNDED LOGGING ENABLED: runtime log rotates at 25 MB with 3 retained files; watchdog log rotates at 5 MB with 3 retained files; 10 installer transcripts retained." -ForegroundColor Green
 Write-Host "HEALTH ENDPOINT STATE: dynamic localhost endpoint is stored as tunnel-health-endpoint.txt; Open-Tunnel-UI.ps1 opens the current admin UI." -ForegroundColor Green
 Write-Host "TAUTULLI REPORTING ENABLED: cached library counts, logical storage, media breakdowns, history/top stats, and local CSV/JSON exports." -ForegroundColor Green
 Write-Host "REPORTING DESIGN: normal questions return compact aggregates; full inventory data crosses the tunnel only when an export is explicitly requested." -ForegroundColor Green
-Write-Host "ARR MANAGEMENT ENABLED: Sonarr/Radarr/Lidarr reporting, adds/edits, explicit-path requests, bulk monitor/profile/search workflows, and inventory exports." -ForegroundColor Green
+Write-Host "ARR MANAGEMENT ENABLED: Sonarr/Radarr/Lidarr reporting, adds/edits, explicit-path requests, bulk monitor/profile/search workflows, inventory exports, wanted/missing, and calendar queries." -ForegroundColor Green
+Write-Host "ACTIVE SESSIONS ENABLED: current Plex playback sessions can be inspected without modifying playback." -ForegroundColor Green
+Write-Host "GENERAL PLAYLIST MANAGEMENT ENABLED: inspect/create/add/remove/clear/delete regular Plex playlists without deleting media." -ForegroundColor Green
+Write-Host "WATCHED STATE ENABLED: exact Plex movies/shows/seasons/episodes can be marked watched or unwatched for the configured Plex user." -ForegroundColor Green
+Write-Host "LETTERBOXD EXPORT ENABLED: Plex-account-scoped Full/Delta/Custom CSV exports are written under $LetterboxdExportDir using Letterboxd's documented import columns." -ForegroundColor Green
 Write-Host "ARR DELETE SAFETY: deletion requires prepare + explicit user confirmation + short-lived token; physical media deletion is separately bound to the prepared choice." -ForegroundColor Green
 Write-Host "EDITABLE ACL ENABLED: protected generated files also grant Full Control to the Windows account that ran this installer." -ForegroundColor Green
-if ($McpServerChanged) {
-    Write-Host "MCP CODE CHANGED: the tunnel runtime was restarted and the new tool schema is now live." -ForegroundColor Cyan
-    Write-Host "Refresh/Rescan the MediaStack Control Gateway app actions in ChatGPT now." -ForegroundColor Cyan
-}
-elseif ($profileChanged -or $TunnelRunnerChanged) {
-    Write-Host "TUNNEL RUNTIME UPDATED: profile/supervisor changes were loaded without changing the MCP tool schema." -ForegroundColor Cyan
-}
+Write-Host "MCP SCHEMA VERIFIED LOCALLY: $ExpectedMcpToolCount tools, gateway v$GatewayVersion, SHA256 $mcpHash" -ForegroundColor Cyan
+Write-Host "TUNNEL CLEAN-RESTARTED: managed tunnel-client/Python leftovers were removed before startup." -ForegroundColor Cyan
+Write-Host "IMPORTANT: ChatGPT keeps its own connector action schema. After this installer completes, use Scan/Refresh tools for the Plex developer app. The local installer cannot force the ChatGPT UI cache to rescan." -ForegroundColor Yellow
 Write-Host ""
 Write-Host "Next in ChatGPT:" -ForegroundColor Cyan
 Write-Host "  Settings -> Connectors/Apps -> add a developer MCP app -> Connection: Tunnel"

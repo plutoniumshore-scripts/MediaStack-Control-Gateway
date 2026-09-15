@@ -5,9 +5,12 @@ MediaStack-Control-Gateway.config.psd1
 media_stack_gateway.py
 run-tunnel.ps1
 watch-tunnel.ps1
+Open-Tunnel-UI.ps1
+mcp-schema-state.json
 profiles/
 logs/
 reporting-exports/
+Letterboxd-Exports/
 bin/
 downloads/
 Python312-NuGet/
