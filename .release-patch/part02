@@ -1,0 +1,434 @@
+or(f"{field_name} must use YYYY-MM-DD format.") from exc
++
++
++def _safe_filename_component(value: str) -> str:
++    clean = re.sub(r'[<>:"/\\|?*]+', '-', str(value or '').strip())
++    clean = re.sub(r'\s+', '-', clean)
++    clean = re.sub(r'-{2,}', '-', clean).strip(' .-_')
++    return clean[:100] or "Letterboxd-Export"
++
++
++def _letterboxd_description(
++    mode: str,
++    description: Optional[str],
++    start_date: Optional[str],
++    end_date: Optional[str],
++    genre: Optional[str],
++    title_contains: Optional[str],
++    library_name: Optional[str],
++) -> str:
++    if description and str(description).strip():
++        return _safe_filename_component(description)
++    if mode == "full":
++        return "All-Watched-Movies"
++    if mode == "delta":
++        return "New-Watches-Since-Last-Export"
++    parts = []
++    if genre:
++        parts.append(f"{genre}-Movies")
++    if title_contains:
++        parts.append(f"Title-{title_contains}")
++    if start_date and end_date:
++        parts.append(f"{start_date}-to-{end_date}")
++    elif start_date:
++        parts.append(f"Since-{start_date}")
++    elif end_date:
++        parts.append(f"Through-{end_date}")
++    if library_name:
++        parts.append(library_name)
++    return _safe_filename_component('-'.join(parts) if parts else "Custom-Watched-Movies")
++
++
++def _letterboxd_writer(buffer):
++    return csv.DictWriter(
++        buffer,
++        fieldnames=LETTERBOXD_COLUMNS,
++        extrasaction="ignore",
++        lineterminator="\n",
++        quoting=csv.QUOTE_MINIMAL,
++        escapechar="\\",
++        doublequote=False,
++    )
++
++
++def _letterboxd_csv_bytes(rows: list[dict]) -> bytes:
++    buf = io.StringIO(newline='')
++    writer = _letterboxd_writer(buf)
++    writer.writeheader()
++    writer.writerows(rows)
++    return buf.getvalue().encode("utf-8")
++
++
++def _letterboxd_row_bytes(row: dict) -> bytes:
++    buf = io.StringIO(newline='')
++    writer = _letterboxd_writer(buf)
++    writer.writerow(row)
++    return buf.getvalue().encode("utf-8")
++
++
++def _write_letterboxd_parts(rows: list[dict], base_name: str) -> list[dict]:
++    export_dir = Path(LETTERBOXD_EXPORT_DIR)
++    export_dir.mkdir(parents=True, exist_ok=True)
++    header_size = len(_letterboxd_csv_bytes([]))
++    chunks = []
++    current = []
++    current_size = header_size
++    for row in rows:
++        row_size = len(_letterboxd_row_bytes(row))
++        if current and current_size + row_size > LETTERBOXD_MAX_FILE_BYTES:
++            chunks.append(current)
++            current = [row]
++            current_size = header_size + row_size
++        else:
++            current.append(row)
++            current_size += row_size
++    chunks.append(current)
++    created = []
++    total_parts = len(chunks)
++    try:
++        for index, chunk in enumerate(chunks, start=1):
++            suffix = f"_Part-{index:02d}-of-{total_parts:02d}" if total_parts > 1 else ""
++            path = export_dir / f"{base_name}{suffix}.csv"
++            payload = _letterboxd_csv_bytes(chunk)
++            path.write_bytes(payload)
++            created.append({"path": str(path), "filename": path.name, "rows": len(chunk), "size_bytes": len(payload)})
++    except Exception:
++        for entry in created:
++            try:
++                Path(entry["path"]).unlink(missing_ok=True)
++            except Exception:
++                pass
++        raise
++    return created
++
++
++def _letterboxd_state_path() -> Path:
++    return Path(LETTERBOXD_EXPORT_DIR) / "letterboxd-export-state.json"
++
++
++def _read_letterboxd_state() -> dict:
++    path = _letterboxd_state_path()
++    if not path.exists():
++        return {}
++    try:
++        data = json.loads(path.read_text(encoding="utf-8"))
++        return data if isinstance(data, dict) else {}
++    except Exception:
++        return {}
++
++
++def _write_letterboxd_state(data: dict) -> None:
++    path = _letterboxd_state_path()
++    path.parent.mkdir(parents=True, exist_ok=True)
++    temp = path.with_suffix('.tmp')
++    temp.write_text(json.dumps(data, indent=2, sort_keys=True), encoding="utf-8")
++    os.replace(temp, path)
++
++
++def _letterboxd_item_meta(server: PlexServer, rating_key: str, cache: dict[str, object]) -> object:
++    if rating_key not in cache:
++        item = server.fetchItem(int(rating_key))
++        try:
++            item.reload(includeGuids=True)
++        except Exception:
++            try:
++                item.reload()
++            except Exception:
++                pass
++        cache[rating_key] = item
++    return cache[rating_key]
++
++
++@mcp.tool(
++    description=(
++        "Generate a Letterboxd-compatible UTF-8 CSV from the configured Plex account only. mode must be full, delta, or custom. "
++        "Full exports all available Plex movie watch history plus watched-state movies lacking a history date. Delta exports watches since the last successful Full/Delta export. "
++        "Custom supports optional YYYY-MM-DD start/end dates, exact Plex movie library, genre, and title substring filters. "
++        "Files are timestamped and stored under the local Letterboxd-Exports folder. Custom exports never advance the Delta checkpoint. "
++        "The tool aborts if it cannot resolve the account associated with the configured Plex token, preventing accidental cross-user export."
++    ),
++    annotations=ToolAnnotations(read_only_hint=False, destructive_hint=False, idempotent_hint=False),
++)
++def letterboxd_export(
++    mode: str,
++    description: Optional[str] = None,
++    start_date: Optional[str] = None,
++    end_date: Optional[str] = None,
++    genre: Optional[str] = None,
++    title_contains: Optional[str] = None,
++    library_name: Optional[str] = None,
++) -> dict:
++    mode_key = str(mode or "").strip().casefold()
++    if mode_key not in {"full", "delta", "custom"}:
++        raise ValueError("mode must be one of: full, delta, custom")
++    start = _parse_ymd(start_date, "start_date")
++    end = _parse_ymd(end_date, "end_date")
++    if start and end and start > end:
++        raise ValueError("start_date cannot be after end_date.")
++    if mode_key == "custom" and not any([start, end, genre, title_contains, library_name]):
++        raise ValueError("Custom export requires at least one filter: start_date, end_date, genre, title_contains, or library_name.")
++
++    server = _plex()
++    account = _plex_token_account(server)
++    sections = _letterboxd_movie_sections(server, library_name)
++    state = _read_letterboxd_state()
++    delta_cutoff = None
++    if mode_key == "delta":
++        raw_cutoff = state.get("last_successful_full_or_delta_utc")
++        if not raw_cutoff:
++            raise ValueError("No prior successful Full/Delta Letterboxd export exists. Run a Full export first or use Custom with a start_date.")
++        try:
++            delta_cutoff = datetime.fromisoformat(str(raw_cutoff).replace("Z", "+00:00"))
++            if delta_cutoff.tzinfo is None:
++                delta_cutoff = delta_cutoff.replace(tzinfo=timezone.utc)
++        except Exception as exc:
++            raise RuntimeError("Stored Letterboxd delta checkpoint is invalid; run a Full export to establish a new checkpoint.") from exc
++
++    history_mindate = delta_cutoff - timedelta(seconds=2) if delta_cutoff is not None else None
++    events = []
++    cache: dict[str, object] = {}
++    for section in sections:
++        history = server.history(accountID=account["id"], librarySectionID=section.key, mindate=history_mindate)
++        for hist in history:
++            if str(_safe_getattr(hist, "type") or _safe_getattr(hist, "TYPE") or "").casefold() != "movie":
++                continue
++            viewed_at = _safe_getattr(hist, "viewedAt")
++            watched_date = _letterboxd_date(viewed_at)
++            if watched_date is None:
++                continue
++            if mode_key == "delta" and delta_cutoff is not None and isinstance(viewed_at, datetime):
++                compare_dt = viewed_at
++                if compare_dt.tzinfo is None:
++                    compare_dt = compare_dt.replace(tzinfo=timezone.utc)
++                if compare_dt <= delta_cutoff:
++                    continue
++            if start and watched_date < start:
++                continue
++            if end and watched_date > end:
++                continue
++            rating_key = str(_safe_getattr(hist, "ratingKey") or "")
++            if not rating_key:
++                continue
++            try:
++                item = _letterboxd_item_meta(server, rating_key, cache)
++            except Exception:
++                continue
++            if title_contains and str(_safe_getattr(item, "title") or "").casefold().find(str(title_contains).casefold()) < 0:
++                continue
++            if genre:
++                tags = [str(_safe_getattr(g, "tag") or "") for g in (_safe_getattr(item, "genres", []) or [])]
++                if not any(str(genre).casefold() in tag.casefold() for tag in tags):
++                    continue
++            events.append({"rating_key": rating_key, "viewed_at": viewed_at, "watched_date": watched_date, "item": item})
++
++    # Oldest-first produces correct rewatch ordering. Same-film/same-date duplicates are
++    # collapsed because Letterboxd itself cannot preserve multiple diary entries for the
++    # same film on the same date during CSV import.
++    def _history_sort_key(row):
++        value = row.get("viewed_at")
++        if isinstance(value, datetime):
++            try:
++                return value.timestamp()
++            except Exception:
++                pass
++        return 0.0
++
++    events.sort(key=_history_sort_key)
++    unique_events = []
++    seen_day_keys = set()
++    for event in events:
++        day_key = (event["rating_key"], event["watched_date"])
++        if day_key in seen_day_keys:
++            continue
++        seen_day_keys.add(day_key)
++        unique_events.append(event)
++
++    selected_counts: dict[str, int] = {}
++    for event in unique_events:
++        selected_counts[event["rating_key"]] = selected_counts.get(event["rating_key"], 0) + 1
++    emitted_counts: dict[str, int] = {}
++    rows = []
++    history_rating_keys = set()
++    for event in unique_events:
++        item = event["item"]
++        rating_key = event["rating_key"]
++        history_rating_keys.add(rating_key)
++        tmdb_id, imdb_id = _letterboxd_ids(item)
++        total_views = int(_safe_getattr(item, "viewCount", 0) or 0)
++        selected_total = selected_counts.get(rating_key, 1)
++        prior_views = max(0, total_views - selected_total)
++        ordinal = emitted_counts.get(rating_key, 0)
++        emitted_counts[rating_key] = ordinal + 1
++        rating = _safe_getattr(item, "userRating")
++        try:
++            rating10 = max(1, min(10, int(round(float(rating))))) if rating is not None and float(rating) > 0 else ""
++        except Exception:
++            rating10 = ""
++        rows.append({
++            "tmdbID": tmdb_id or "",
++            "imdbID": imdb_id or "",
++            "Title": _safe_getattr(item, "title") or "",
++            "Year": _safe_getattr(item, "year") or "",
++            "Rating10": rating10,
++            "WatchedDate": event["watched_date"],
++            "Rewatch": "true" if (prior_views + ordinal) > 0 else "false",
++        })
++
++    # Full mode also captures items Plex currently marks watched even if there is no
++    # corresponding dated history event. These are imported as watched without inventing a date.
++    undated_watched_count = 0
++    if mode_key == "full":
++        for section in sections:
++            for movie in section.all():
++                rating_key = str(_safe_getattr(movie, "ratingKey") or "")
++                if not rating_key or rating_key in history_rating_keys:
++                    continue
++                if int(_safe_getattr(movie, "viewCount", 0) or 0) <= 0:
++                    continue
++                try:
++                    item = _letterboxd_item_meta(server, rating_key, cache)
++                except Exception:
++                    item = movie
++                tmdb_id, imdb_id = _letterboxd_ids(item)
++                rating = _safe_getattr(item, "userRating")
++                try:
++                    rating10 = max(1, min(10, int(round(float(rating))))) if rating is not None and float(rating) > 0 else ""
++                except Exception:
++                    rating10 = ""
++                rows.append({
++                    "tmdbID": tmdb_id or "",
++                    "imdbID": imdb_id or "",
++                    "Title": _safe_getattr(item, "title") or "",
++                    "Year": _safe_getattr(item, "year") or "",
++                    "Rating10": rating10,
++                    "WatchedDate": "",
++                    "Rewatch": "",
++                })
++                undated_watched_count += 1
++
++    generated_at = datetime.now(timezone.utc)
++    file_stamp = datetime.now().strftime("%Y-%m-%d_%H%M%S")
++    desc = _letterboxd_description(mode_key, description, start, end, genre, title_contains, library_name)
++    type_name = mode_key.title()
++    base_name = f"{file_stamp}_{desc}_{type_name}"
++    files = _write_letterboxd_parts(rows, base_name)
++
++    if mode_key in {"full", "delta"}:
++        _write_letterboxd_state({
++            "version": 1,
++            "last_successful_full_or_delta_utc": generated_at.isoformat().replace("+00:00", "Z"),
++            "last_mode": mode_key,
++            "last_row_count": len(rows),
++            "last_files": [entry["filename"] for entry in files],
++        })
++
++    return {
++        "mode": mode_key,
++        "plex_account_id": account["id"],
++        "plex_account": account.get("username") or account.get("friendly_name"),
++        "source": "Plex",
++        "other_plex_users_included": False,
++        "row_count": len(rows),
++        "dated_history_rows": len(unique_events),
++        "undated_watched_rows": undated_watched_count,
++        "files": files,
++        "delta_checkpoint_advanced": mode_key in {"full", "delta"},
++        "delta_previous_checkpoint": state.get("last_successful_full_or_delta_utc") if mode_key == "delta" else None,
++        "columns": LETTERBOXD_COLUMNS,
++        "letterboxd_size_limit_protection": True,
++    }
++
++
++# ===========================================================================
+ # Tautulli-backed reporting subsystem
+ # ===========================================================================
+ 
+@@ -3262,7 +4134,7 @@
+ 
+ def _tautulli_api(cmd: str, params: Optional[dict] = None, timeout: int = 60):
+     url = _tautulli_endpoint(cmd, params)
+-    request = Request(url, headers={"User-Agent": "MediaStack-Control-Gateway/3.4.6"})
++    request = Request(url, headers={"User-Agent": "MediaStack-Control-Gateway/3.5.3"})
+     try:
+         with urlopen(request, timeout=timeout) as response:
+             raw = response.read()
+@@ -3876,7 +4748,7 @@
+ def _download_export_to_local_cache(export_id: int) -> dict:
+     export_id = int(export_id)
+     url = _tautulli_endpoint("download_export", {"export_id": export_id})
+-    request = Request(url, headers={"User-Agent": "MediaStack-Control-Gateway/3.4.6"})
++    request = Request(url, headers={"User-Agent": "MediaStack-Control-Gateway/3.5.3"})
+     try:
+         with urlopen(request, timeout=300) as response:
+             raw = response.read()
+@@ -4131,7 +5003,7 @@
+     headers = {
+         "X-Api-Key": cfg["api_key"],
+         "Accept": "application/json",
+-        "User-Agent": "MediaStack-Control-Gateway-Arr/3.4.5",
++        "User-Agent": "MediaStack-Control-Gateway-Arr/3.5.3",
+     }
+     if body is not None:
+         data = json.dumps(body).encode("utf-8")
+@@ -4316,6 +5188,53 @@
+     return data if isinstance(data, list) else []
+ 
+ 
++def _arr_find_existing_by_external_id(app: str, external_id) -> Optional[dict]:
++    """Find an already-managed Arr item by its stable external provider ID."""
++    name = str(app).casefold()
++    field = {"radarr": "tmdbId", "sonarr": "tvdbId", "lidarr": "foreignArtistId"}[name]
++    wanted = str(external_id).strip().casefold()
++    for item in _arr_all_items(name):
++        value = item.get(field)
++        if value is not None and str(value).strip().casefold() == wanted:
++            return item
++        # Lidarr versions/plugins can sometimes expose mbId instead.
++        if name == "lidarr":
++            mb_value = item.get("mbId")
++            if mb_value is not None and str(mb_value).strip().casefold() == wanted:
++                return item
++    return None
++
++
++def _arr_add_error_result(app: str, external_id, exc: Exception) -> dict:
++    message = str(exc)
++    lowered = message.casefold()
++    reason = "timeout" if "timed out" in lowered or "timeout" in lowered else "api_error"
++
++    # A POST can complete in Arr even when the caller times out waiting for the
++    # response. Re-query the local library before declaring failure.
++    try:
++        existing = _arr_find_existing_by_external_id(app, external_id)
++    except Exception:
++        existing = None
++    if isinstance(existing, dict):
++        return {
++            "added": True,
++            "already_exists": False,
++            "verified_after_error": True,
++            "request_error": message,
++            **_arr_item_label(app, existing),
++        }
++
++    return {
++        "added": False,
++        "already_exists": False,
++        "reason": reason,
++        "message": message,
++        "app": app,
++        "external_id": str(external_id),
++    }
++
++
+ def _arr_file_owner_id(app: str, file_row: dict) -> Optional[int]:
+     field = {"radarr": "movieId", "sonarr": "seriesId", "lidarr": "artistId"}[app]
+     value = file_row.get(field)
+@@ -4605,8 +5524,179 @@
+ def arr_command_status(app: str, command_id: int) -> dict:
+     name = str(app).casefold()
+     _arr_cfg(name)
+-    data = _arr_api(name, "GET", f"command/{int(command_id)}")
+-    return data if isinstance(data, dict) else {"result": data}
++    try:
++        data = _arr_api(name, "GET", f"command/{int(command_
