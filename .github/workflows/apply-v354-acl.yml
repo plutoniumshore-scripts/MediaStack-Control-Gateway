@@ -1,0 +1,35 @@
+name: Apply v3.5.4 ACL fix
+
+on:
+  push:
+    branches:
+      - release-v3.5.4-acl
+    paths:
+      - .staging/v3.5.4-acl.patch
+      - .github/workflows/apply-v354-acl.yml
+
+permissions:
+  contents: write
+
+jobs:
+  apply:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Apply reviewed patch
+        shell: bash
+        run: |
+          set -euo pipefail
+          git apply --check .staging/v3.5.4-acl.patch
+          git apply .staging/v3.5.4-acl.patch
+          grep -q "\$GatewayVersion = '3.5.4'" Install-MediaStack-Control-Gateway.ps1
+          test "$(grep -c '^@mcp\.tool(' Install-MediaStack-Control-Gateway.ps1)" -eq 96
+          rm -f .staging/v3.5.4-acl.patch .github/workflows/apply-v354-acl.yml
+          rmdir .staging 2>/dev/null || true
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          git commit -m "Apply v3.5.4 ACL inheritance fix"
+          git push
