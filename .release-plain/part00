@@ -1,0 +1,296 @@
+#requires -RunAsAdministrator
+<#
+MediaStack Control Gateway Installer for Windows Server
+v3.5.3
+
+MediaStack Control Gateway provides a private MCP control and reporting layer for
+Plex, Tautulli, Sonarr, Radarr, and Lidarr through OpenAI Secure MCP Tunnel.
+
+The installer is noninteractive and safe to run repeatedly. It manages an
+application-local Python runtime, the MCP server, the tunnel profile, scheduled
+tasks, bounded logs, health monitoring, and local reporting/export directories.
+
+v3.5.0
+  * Added active Plex sessions, regular playlist management, Arr wanted/missing
+    and calendar queries, reversible watched/unwatched controls, and
+    Plex-account-scoped Letterboxd Full/Delta/Custom CSV exports.
+
+v3.5.1
+  * Added generated-schema validation and forced managed-runtime refresh so a
+    stale local MCP schema cannot remain active after an installer update.
+
+v3.5.2
+  * Fixed post-mutation playlist counts, added read-only watch-state inspection,
+    structured validation/not-found results, Arr duplicate prechecks, and
+    post-timeout verification for Arr additions.
+
+v3.5.3
+  * Made watched/unwatched writes idempotent so repeated requests do not
+    increment Plex viewCount or perform unnecessary state writes.
+
+Safety behavior:
+  * Arr deletions require a short-lived prepare/confirm token.
+  * New Radarr/Sonarr/Lidarr additions require an explicit root folder/profile.
+  * The tunnel health/admin listener binds only to loopback.
+  * Credentials and environment-specific addresses are loaded from the local
+    MediaStack-Control-Gateway.config.psd1 file, which should never be committed.
+
+Default install root:
+  C:\Scripts\MediaStack-Control-Gateway
+#>
+
+Set-StrictMode -Version Latest
+$ErrorActionPreference = 'Stop'
+$ProgressPreference = 'Continue'
+
+# HARD NONINTERACTIVE MODE
+# Equivalent to answering "Yes to All" for PowerShell confirmation prompts.
+$ConfirmPreference = 'None'
+$PSDefaultParameterValues['*:Confirm'] = $false
+
+# Force overwrite/removal behavior only for common filesystem cmdlets used by
+# this installer. This prevents repeat runs from stopping for confirmation.
+$PSDefaultParameterValues['New-Item:Force'] = $true
+$PSDefaultParameterValues['Copy-Item:Force'] = $true
+$PSDefaultParameterValues['Move-Item:Force'] = $true
+$PSDefaultParameterValues['Remove-Item:Force'] = $true
+$PSDefaultParameterValues['Set-Content:Force'] = $true
+
+[Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+
+# Normalize severity colors for the interactive installer console. Neutral data
+# remains at the host default color. These assignments are best-effort because
+# some non-console hosts do not expose mutable PrivateData color properties.
+try {
+    if ($null -ne $Host.PrivateData) {
+        $Host.PrivateData.WarningForegroundColor = 'Yellow'
+        $Host.PrivateData.ErrorForegroundColor = 'Red'
+    }
+}
+catch {
+}
+
+# ===========================================================================
+# Local configuration
+# ===========================================================================
+# Copy MediaStack-Control-Gateway.config.example.psd1 to
+# MediaStack-Control-Gateway.config.psd1 and replace every <REQUIRED: ...>
+# placeholder before running the installer. The real config file is excluded by
+# the repository .gitignore and receives a restricted local ACL during setup.
+$ConfigFileName = 'MediaStack-Control-Gateway.config.psd1'
+$ConfigPath = Join-Path $PSScriptRoot $ConfigFileName
+
+if (-not (Test-Path -LiteralPath $ConfigPath)) {
+    throw "Configuration file not found: $ConfigPath`r`nCopy MediaStack-Control-Gateway.config.example.psd1 to $ConfigFileName and replace every <REQUIRED: ...> placeholder."
+}
+
+$Config = Import-PowerShellDataFile -LiteralPath $ConfigPath
+
+$TunnelId = [string]$Config['TunnelId']
+$OpenAiRuntimeKey = [string]$Config['OpenAiRuntimeKey']
+$PlexUrl = [string]$Config['PlexUrl']
+$PlexToken = [string]$Config['PlexToken']
+$TautulliUrl = [string]$Config['TautulliUrl']
+$TautulliApiKey = [string]$Config['TautulliApiKey']
+$SonarrUrl = [string]$Config['SonarrUrl']
+$SonarrApiKey = [string]$Config['SonarrApiKey']
+$RadarrUrl = [string]$Config['RadarrUrl']
+$RadarrApiKey = [string]$Config['RadarrApiKey']
+$LidarrUrl = [string]$Config['LidarrUrl']
+$LidarrApiKey = [string]$Config['LidarrApiKey']
+
+if ($Config.ContainsKey('InstallRoot') -and -not [string]::IsNullOrWhiteSpace([string]$Config['InstallRoot'])) {
+    $Root = [string]$Config['InstallRoot']
+}
+else {
+    $Root = 'C:\Scripts\MediaStack-Control-Gateway'
+}
+
+function Get-OptionalPositiveInt {
+    param(
+        [Parameter(Mandatory=$true)][string]$Name,
+        [Parameter(Mandatory=$true)][int]$Default
+    )
+    if (-not $Config.ContainsKey($Name) -or $null -eq $Config[$Name] -or [string]::IsNullOrWhiteSpace([string]$Config[$Name])) {
+        return $Default
+    }
+    $value = 0
+    if (-not [int]::TryParse([string]$Config[$Name], [ref]$value) -or $value -lt 1) {
+        throw "Optional configuration field '$Name' must be a positive integer."
+    }
+    return $value
+}
+
+# ===========================================================================
+# Fixed paths
+# ===========================================================================
+$BinDir = Join-Path $Root 'bin'
+$DownloadDir = Join-Path $Root 'downloads'
+$ProfileDir = Join-Path $Root 'profiles'
+$LogDir = Join-Path $Root 'logs'
+$ReportingExportDir = Join-Path $Root 'reporting-exports'
+$LetterboxdExportDir = Join-Path $Root 'Letterboxd-Exports'
+$HealthUrlFile = Join-Path $LogDir 'tunnel-health-endpoint.txt'
+$LegacyHealthUrlFile = Join-Path $LogDir 'tunnel-health.url'
+$WatchdogStateFile = Join-Path $LogDir 'tunnel-watchdog-state.json'
+$OpenTunnelUiScript = Join-Path $Root 'Open-Tunnel-UI.ps1'
+
+# Managed log/watchdog policy. Defaults can be overridden in the local configuration file.
+$RuntimeLogMaxBytes = (Get-OptionalPositiveInt -Name 'RuntimeLogMaxMB' -Default 25) * 1MB
+$RuntimeLogRetainedFiles = Get-OptionalPositiveInt -Name 'RuntimeLogRetainedFiles' -Default 3
+$WatchdogLogMaxBytes = (Get-OptionalPositiveInt -Name 'WatchdogLogMaxMB' -Default 5) * 1MB
+$WatchdogLogRetainedFiles = Get-OptionalPositiveInt -Name 'WatchdogLogRetainedFiles' -Default 3
+$InstallerLogRetainCount = Get-OptionalPositiveInt -Name 'InstallerLogRetainCount' -Default 10
+$WatchdogReadinessFailureThreshold = Get-OptionalPositiveInt -Name 'WatchdogReadinessFailureThreshold' -Default 3
+$WatchdogReadinessRestartCooldownMinutes = Get-OptionalPositiveInt -Name 'WatchdogReadinessRestartCooldownMinutes' -Default 10
+$WatchdogStartupGraceSeconds = Get-OptionalPositiveInt -Name 'WatchdogStartupGraceSeconds' -Default 90
+$WatchdogHealthyHeartbeatMinutes = Get-OptionalPositiveInt -Name 'WatchdogHealthyHeartbeatMinutes' -Default 60
+# Python is deliberately application-local. We use the official CPython NuGet
+# distribution instead of the Windows MSI/bootstrapper, so there is no Windows
+# installation state, registry entry, maintenance mode, or reboot dependency.
+$PythonPackageVersion = '3.12.10'
+$PythonDir = Join-Path $Root 'Python312-NuGet'
+$PythonExe = Join-Path $PythonDir 'tools\python.exe'
+$TunnelExe = Join-Path $BinDir 'tunnel-client.exe'
+$CloudflaredExe = Join-Path $BinDir 'cloudflared.exe'
+$McpServer = Join-Path $Root 'media_stack_gateway.py'
+$TunnelRunner = Join-Path $Root 'run-tunnel.ps1'
+$WatchdogScript = Join-Path $Root 'watch-tunnel.ps1'
+$TaskName = 'MediaStack Control Gateway Tunnel'
+$WatchdogTaskName = 'MediaStack Control Gateway Tunnel Watchdog'
+$ProfileName = 'media-stack'
+$TotalStages = 12
+$GatewayVersion = '3.5.3'
+$ExpectedMcpToolCount = 96
+$ForceSchemaReload = $true
+$RequiredMcpTools = @(
+    'plex_active_sessions',
+    'plex_get_playlist_items',
+    'plex_create_playlist',
+    'plex_add_playlist_items',
+    'plex_remove_playlist_items',
+    'plex_clear_playlist',
+    'plex_delete_playlist',
+    'plex_get_watch_state',
+    'plex_mark_watched',
+    'plex_mark_unwatched',
+    'letterboxd_export',
+    'arr_wanted',
+    'arr_calendar'
+)
+$SchemaStateFile = Join-Path $Root 'mcp-schema-state.json'
+
+# ===========================================================================
+# Timestamped installer transcript logging
+# ===========================================================================
+# Capture the complete installer console stream, including warnings and errors,
+# so installation problems can be reviewed after the PowerShell window closes.
+# This is separate from the tunnel runtime/watchdog/doctor logs below.
+if (-not (Test-Path -LiteralPath $LogDir)) {
+    New-Item -ItemType Directory -Path $LogDir -Force -Confirm:$false | Out-Null
+}
+
+$InstallerTimestamp = Get-Date -Format 'yyyyMMdd-HHmmss'
+$InstallerLog = Join-Path $LogDir ("installer-{0}.log" -f $InstallerTimestamp)
+$InstallerTranscriptActive = $false
+
+try {
+    Start-Transcript -Path $InstallerLog -Force -ErrorAction Stop | Out-Null
+    $InstallerTranscriptActive = $true
+}
+catch {
+    # Logging must never prevent the installer itself from running.
+    Write-Warning "Unable to start installer transcript logging at '$InstallerLog': $($_.Exception.Message)"
+}
+
+# Retain only the newest managed installer transcripts. Neutral historical logs
+# with other names are left untouched.
+try {
+    $oldInstallerLogs = @(
+        Get-ChildItem -LiteralPath $LogDir -Filter 'installer-*.log' -File -ErrorAction SilentlyContinue |
+            Sort-Object LastWriteTime -Descending |
+            Select-Object -Skip $InstallerLogRetainCount
+    )
+    foreach ($oldInstallerLog in $oldInstallerLogs) {
+        Remove-Item -LiteralPath $oldInstallerLog.FullName -Force -Confirm:$false -ErrorAction SilentlyContinue
+    }
+}
+catch {
+    Write-Warning "Installer log retention cleanup could not complete: $($_.Exception.Message)"
+}
+
+try {
+
+function Expand-ZipNoPrompt {
+    param(
+        [Parameter(Mandatory=$true)][string]$Source,
+        [Parameter(Mandatory=$true)][string]$Destination,
+        [switch]$CleanDestination
+    )
+
+    if (-not (Test-Path -LiteralPath $Source)) {
+        throw "ZIP source does not exist: $Source"
+    }
+
+    if ($CleanDestination -and (Test-Path -LiteralPath $Destination)) {
+        Remove-Item -LiteralPath $Destination -Recurse -Force -Confirm:$false
+    }
+
+    if (-not (Test-Path -LiteralPath $Destination)) {
+        New-Item -ItemType Directory -Path $Destination -Force -Confirm:$false | Out-Null
+    }
+
+    # Use .NET directly instead of Expand-Archive. This bypasses PowerShell's
+    # ShouldProcess confirmation mechanism completely.
+    Add-Type -AssemblyName System.IO.Compression.FileSystem -ErrorAction SilentlyContinue
+
+    try {
+        [System.IO.Compression.ZipFile]::ExtractToDirectory($Source, $Destination)
+    }
+    catch {
+        throw "ZIP extraction failed for '$Source' -> '$Destination': $($_.Exception.Message)"
+    }
+}
+
+function Get-TunnelHealthBaseUrl {
+    if (-not (Test-Path -LiteralPath $HealthUrlFile)) {
+        return $null
+    }
+
+    try {
+        $url = (Get-Content -LiteralPath $HealthUrlFile -Raw -ErrorAction Stop).Trim()
+        if ($url -match '^http://127\.0\.0\.1:\d+$') {
+            return $url.TrimEnd('/')
+        }
+    }
+    catch {
+    }
+
+    return $null
+}
+
+function Get-TunnelLocalProbe {
+    param(
+        [Parameter(Mandatory=$true)][ValidateSet('/healthz','/readyz')][string]$Path,
+        [int]$TimeoutSeconds = 3
+    )
+
+    $baseUrl = Get-TunnelHealthBaseUrl
+    if (-not $baseUrl) {
+        return [pscustomobject]@{ Ok = $false; StatusCode = $null; Body = ''; Error = 'Health endpoint file is missing or invalid.'; BaseUrl = $null }
+    }
+
+    try {
+        $response = Invoke-WebRequest -UseBasicParsing -Uri ($baseUrl + $Path) -TimeoutSec $TimeoutSeconds -ErrorAction Stop
+        return [pscustomobject]@{
+            Ok = ($response.StatusCode -eq 200)
+            StatusCode = [int]$response.StatusCode
+            Body = [string]$response.Content
+            Error = $null
+            BaseUrl = $baseUrl
+        }
+    }
+    catch {
+        $statusCode = $null
+        $body = ''
+        
