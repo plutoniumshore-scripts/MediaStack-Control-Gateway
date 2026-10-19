@@ -1,5 +1,7 @@
 # MediaStack Control Gateway
 
+> **Project status — October 2026:** I have stepped away from active development of MediaStack Control Gateway for the time being. The project and its documentation remain available, and I'm more than happy to answer questions. Feel free to open an issue if you have one.
+
 **Control and query Plex, Tautulli, Sonarr, Radarr, and Lidarr from ChatGPT through a private MCP gateway.**
 
 MediaStack Control Gateway is a Windows Server based MCP gateway for self-hosted media environments. It exposes a defined set of MCP actions for library inspection, metadata management, playlists, reporting, playback state, and controlled Arr administration without exposing the media applications themselves as public Internet services.
